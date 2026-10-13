@@ -20,6 +20,12 @@
 - mp4 で書き出し → 保存・共有（https のときのみ）/ダウンロード
 - ホーム画面に追加できる（manifest + Service Worker。https で公開したときに有効）
 
+## 公開先
+
+- アプリ: https://kenta0920k-sketch.github.io/clip-diary/ （GitHub Pages、`main` ブランチの直下を公開）
+- リポジトリ: https://github.com/kenta0920k-sketch/clip-diary
+- 更新のしかた: `sw.js` の `VERSION` を上げてから `main` に push すると、1〜2分で反映される
+
 ## ファイル
 
 - `index.html` … アプリ本体（HTML/CSS/JS 1ファイル）
