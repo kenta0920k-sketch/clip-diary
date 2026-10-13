@@ -40,6 +40,18 @@
     font-size: 16px; font-weight: 600;
   }
   .pick small { color: var(--sub); font-weight: 400; font-size: 12px; }
+  #pickLabel { white-space: nowrap; }
+  .pick.compact { gap: 12px; }
+  .pick.compact small { text-align: left; font-size: 11px; }
+  .shape { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; font-size: 14px; font-weight: 600; }
+  .shape .seg button { padding: 8px 14px; font-size: 14px; }
+  .notice {
+    display: flex; align-items: center; gap: 10px; margin-top: 10px; padding: 10px 12px; border-radius: 12px;
+    background: rgba(255,138,61,.1); border: 1px solid rgba(255,138,61,.35); font-size: 13px; line-height: 1.5;
+  }
+  .notice span { flex: 1; }
+  .notice button { flex: none; border: 1px solid #555; background: #1c1c1c; border-radius: 9px; padding: 6px 10px; font-size: 12px; }
+  .thumb .or { position: absolute; right: 4px; bottom: 4px; font-size: 10px; background: rgba(0,0,0,.65); padding: 1px 5px; border-radius: 5px; }
   .pick.compact { padding: 12px; flex-direction: row; font-size: 14px; }
   input[type=file] { display: none; }
 
@@ -168,11 +180,23 @@
 </header>
 
 <main>
+  <div class="shape">
+    <span>つくる動画の形</span>
+    <div class="seg" data-key="aspect">
+      <button data-val="9:16">縦</button><button data-val="16:9">横</button><button data-val="1:1">正方形</button>
+    </div>
+  </div>
+
   <button class="pick" id="pickBtn">
-    ＋ 動画を選ぶ
-    <small>何本でもまとめて選べます</small>
+    <span id="pickLabel">＋ 動画を選ぶ</span>
+    <small id="pickHint">何本でもまとめて選べます</small>
   </button>
   <input type="file" id="fileInput" accept="video/*" multiple>
+
+  <div class="notice" id="hiddenNotice" style="display:none">
+    <span id="hiddenText"></span>
+    <button id="hiddenUse">これも使う</button>
+  </div>
 
   <div class="listhead">
     <span id="listInfo">クリップ</span>
@@ -186,12 +210,6 @@
       <label>1本の長さ</label>
       <div class="seg" data-key="seconds">
         <button data-val="1">1秒</button><button data-val="2">2秒</button><button data-val="3">3秒</button><button data-val="5">5秒</button>
-      </div>
-    </div>
-    <div class="row">
-      <label>画面の形</label>
-      <div class="seg" data-key="aspect">
-        <button data-val="9:16">縦</button><button data-val="16:9">横</button><button data-val="1:1">正方形</button>
       </div>
     </div>
     <div class="row">
@@ -711,19 +729,88 @@ async function makeThumb(c) {
   }
   c.thumb = cv.toDataURL('image/jpeg', 0.7);
   c.thumbStart = c.start;
+  // 向きを先に調べられなかった動画は、ここで判定する
+  if (!c.orient) {
+    c.orient = orientOf(v.videoWidth, v.videoHeight);
+    if (isMismatched(c)) reconcile();
+  }
 }
+
+// ---------- 動画の向き（縦・横）で振り分け ----------
+// 「横」を選んでいるときは縦向きの動画を、「縦」のときは横向きの動画を自動で外す（正方形はどちらも使う）
+const ORIENT_LABEL = { portrait: '縦', landscape: '横', square: '正方形' };
+const orientOf = (w, h) => (!w || !h ? null : w / h > 1.1 ? 'landscape' : w / h < 0.9 ? 'portrait' : 'square');
+const unwantedOrient = () => ({ '9:16': 'landscape', '16:9': 'portrait' }[state.aspect] || null);
+const isMismatched = (c) => !c.keep && c.orient && c.orient === unwantedOrient();
+state.hidden = [];
+
+function reconcile() {
+  const all = [...state.clips, ...state.hidden];
+  state.clips = all.filter((c) => !isMismatched(c));
+  state.hidden = all.filter(isMismatched);
+  // 戻ってきた動画のサムネイルがまだなければ作る
+  state.clips.forEach((c) => { if (c.orient && !c.thumb && !c.error) enqueueThumb(c); });
+  renderNotice();
+}
+
+function renderNotice() {
+  const n = state.hidden.length;
+  $('#hiddenNotice').style.display = n ? '' : 'none';
+  if (n) {
+    const shape = state.aspect === '16:9' ? '横' : '縦';
+    $('#hiddenText').textContent = `${ORIENT_LABEL[unwantedOrient()]}向きの動画${n}本は外しました（${shape}の動画をつくる設定のため）`;
+  }
+  $('#pickHint').textContent = {
+    '9:16': '縦向きの動画だけ使います（横向きは自動で外します）',
+    '16:9': '横向きの動画だけ使います（縦向きは自動で外します）',
+    '1:1': '縦・横どちらの動画も使えます',
+  }[state.aspect];
+}
+
+$('#hiddenUse').addEventListener('click', () => {
+  state.hidden.forEach((c) => { c.keep = true; });
+  reconcile();
+  renderList();
+});
+
+// 動画の向きだけを先に素早く調べる（映像の読み込みはしないので軽い）
+const probeVideo = document.createElement('video');
+probeVideo.muted = true;
+probeVideo.preload = 'metadata';
+let probing = Promise.resolve();
 
 function addFiles(files) {
   const list = [...files].filter((f) => f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm|3gp)$/i.test(f.name));
-  for (const file of list) {
-    const c = {
-      id: ++uid, file, name: file.name, url: URL.createObjectURL(file),
-      duration: 0, start: 0, date: guessDate(file), thumb: '', strip: null, confirmed: false, error: '', text: null,
-    };
-    state.clips.push(c);
-    enqueueThumb(c);
-  }
-  renderList();
+  const job = async () => {
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      $('#pickLabel').textContent = `読み込み中… ${i + 1} / ${list.length}`;
+      const c = {
+        id: ++uid, file, name: file.name, url: URL.createObjectURL(file),
+        duration: 0, start: 0, date: guessDate(file), thumb: '', strip: null, confirmed: false, error: '', text: null,
+        orient: null, keep: false,
+      };
+      try {
+        await loadSrc(probeVideo, c.url);
+        c.orient = orientOf(probeVideo.videoWidth, probeVideo.videoHeight);
+      } catch (e) {
+        console.warn('probe', c.name, e);
+      }
+      if (isMismatched(c)) {
+        state.hidden.push(c);
+        renderNotice();
+      } else {
+        state.clips.push(c);
+        enqueueThumb(c);
+        renderList();
+      }
+    }
+    releaseVideo(probeVideo);
+    $('#pickLabel').textContent = '＋ 動画を選ぶ';
+    renderList();
+  };
+  // 続けて選んだときは、前の分が終わってから
+  probing = probing.then(job, job);
 }
 
 // ---------- 一覧 ----------
@@ -772,6 +859,7 @@ function renderList() {
       <button class="thumb" data-act="edit" aria-label="編集">
         ${c.thumb ? `<img src="${c.thumb}" alt="">` : ''}
         <span class="no">${i + 1}</span>
+        ${c.orient ? `<span class="or">${ORIENT_LABEL[c.orient]}</span>` : ''}
       </button>
       <div class="meta" data-act="edit" role="button">
         <div class="date">${dateLabel(c.date)}</div>
@@ -887,6 +975,11 @@ document.addEventListener('click', (e) => {
   const key = b.closest('.seg').dataset.key;
   state[key] = key === 'seconds' ? +b.dataset.val : b.dataset.val;
   if (key === 'seconds') state.clips.forEach((c) => { c.start = Math.min(c.start, maxStart(c)); });
+  if (key === 'aspect') {
+    // 形を変えたら、向きの合う動画に入れ替える（「これも使う」はリセット）
+    [...state.clips, ...state.hidden].forEach((c) => { c.keep = false; });
+    reconcile();
+  }
   saveSettings();
   syncSegs();
   renderList();
@@ -1559,6 +1652,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
   navigator.serviceWorker.register('sw.js').catch((e) => console.warn('sw', e));
 }
 
+renderNotice();
 renderList();
 </script>
 </body>
