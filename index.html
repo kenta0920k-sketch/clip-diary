@@ -641,21 +641,40 @@ function enqueueThumb(c) {
   runThumbQueue();
 }
 
+// 動画を読み込む video 要素を空にして、スマホの動画デコーダー（同時に使える数が少ない）を解放する
+function releaseVideo(v) {
+  v.pause();
+  v.removeAttribute('src');
+  delete v.dataset.src;
+  v.load();
+}
+
+// 編集画面や書き出し中は、サムネイル作りを止めておく（4K動画などを同時にいくつも読み込むと固まるため）
+const busy = () => editorOpen || building;
+
 async function runThumbQueue() {
   if (thumbWorking) return;
   thumbWorking = true;
-  while (thumbQueue.length) {
+  while (thumbQueue.length && !busy()) {
     const c = thumbQueue.shift();
     if (!state.clips.includes(c)) continue;
     try {
-      await makeThumb(c);
+      await makeThumb(c).catch(async (e) => {
+        // 一度だけ、少し待ってからやり直す
+        console.warn('thumb retry', c.name, e);
+        releaseVideo(thumbVideo);
+        await new Promise((r) => setTimeout(r, 800));
+        await makeThumb(c);
+      });
       c.error = '';
     } catch (e) {
       console.warn(c.name, e);
-      c.error = 'この動画は読み込めませんでした';
+      // すでに読み込めている動画なら、サムネイルの作り直しに失敗しても前のものを使い続ける
+      if (!c.duration || !c.thumb) c.error = 'この動画は読み込めませんでした';
     }
     renderList();
   }
+  releaseVideo(thumbVideo);
   thumbWorking = false;
 }
 
@@ -691,6 +710,7 @@ async function makeThumb(c) {
     }
   }
   c.thumb = cv.toDataURL('image/jpeg', 0.7);
+  c.thumbStart = c.start;
 }
 
 function addFiles(files) {
@@ -918,6 +938,10 @@ $('#editTabs').addEventListener('click', (e) => {
 function loadEditClip(c) {
   editing = c;
   userPaused = false;
+  editRetry = 0;
+  stripToken++;
+  // 前の動画のコマ並び作りを止めて、デコーダーを空けてから次を読み込む
+  releaseVideo(stripVideo);
   const list = readyClips();
   const idx = list.indexOf(c);
   $('#editTitle').textContent = `${idx + 1} / ${list.length}本目`;
@@ -946,6 +970,9 @@ async function makeStrip(c) {
     if (c.strip.every(Boolean)) return;
   }
   c.strip = c.strip || new Array(STRIP_N).fill('');
+  // まずプレビューの再生を優先し、映像が出てからコマ並びを作り始める
+  await Promise.race([waitEvent(ev, 'playing', 3000).catch(() => {}), new Promise((r) => setTimeout(r, 1500))]);
+  if (token !== stripToken) return;
   try {
     await loadSrc(stripVideo, c.url);
     try { await stripVideo.play(); stripVideo.pause(); } catch (_) {}
@@ -965,6 +992,7 @@ async function makeStrip(c) {
   } catch (e) {
     console.warn('strip', e);
   }
+  if (token === stripToken) releaseVideo(stripVideo);
 }
 
 function updateWindow() {
@@ -992,6 +1020,28 @@ function previewSeek(t) {
   if (ev.seeking) { seekPending = t; return; }
   ev.currentTime = t;
 }
+// 読み込みに失敗したら、一度だけ自動でやり直す
+let editRetry = 0;
+ev.addEventListener('error', () => {
+  if (!editorOpen || !editing || !ev.dataset.src) return;
+  const c = editing;
+  if (editRetry >= 1) {
+    showHint('読み込めませんでした');
+    return;
+  }
+  editRetry++;
+  releaseVideo(stripVideo);
+  stripToken++;
+  setTimeout(() => {
+    if (editing !== c) return;
+    ev.dataset.src = c.url;
+    ev.src = c.url;
+    ev.currentTime = c.start;
+    ev.play().catch(() => {});
+    makeStrip(c);
+  }, 600);
+});
+
 ev.addEventListener('seeked', () => {
   if (seekPending != null) {
     const t = seekPending;
@@ -1113,10 +1163,16 @@ function moveText(p) {
 function togglePlay() {
   if (ev.paused) { userPaused = false; ev.play().catch(() => {}); }
   else { userPaused = true; ev.pause(); }
+  showHint(userPaused ? '❚❚' : '▶');
+}
+
+function showHint(text) {
   const hint = $('#editHint');
-  hint.textContent = userPaused ? '❚❚' : '▶';
+  hint.textContent = text;
+  hint.style.fontSize = text.length > 2 ? '16px' : '';
   hint.classList.add('show');
-  setTimeout(() => hint.classList.remove('show'), 500);
+  clearTimeout(showHint.t);
+  showHint.t = setTimeout(() => hint.classList.remove('show'), text.length > 2 ? 2000 : 500);
 }
 
 // 色味タブ（今のクリップのサムネイルで見本を作る）
@@ -1212,19 +1268,19 @@ $('#textApplyAll').addEventListener('click', () => {
 function leaveClip() {
   const c = editing;
   c.confirmed = true;
-  enqueueThumb(c);
+  // 使う部分が変わったときだけサムネイルを作り直す（編集画面を閉じてから）
+  if (c.thumbStart !== c.start) enqueueThumb(c);
 }
 
 function closeEditor() {
   editorOpen = false;
   editing = null;
   stripToken++;
-  ev.pause();
-  ev.removeAttribute('src');
-  delete ev.dataset.src;
-  ev.load();
+  releaseVideo(ev);
+  releaseVideo(stripVideo);
   $('#editor').classList.remove('show');
   renderList();
+  runThumbQueue();
 }
 
 $('#editClose').addEventListener('click', () => { leaveClip(); closeEditor(); });
@@ -1243,6 +1299,7 @@ $('#editNext').addEventListener('click', () => {
 
 // ---------- 書き出し ----------
 const rv = $('#renderVideo');
+let building = false;
 let audioCtx = null, mediaSrc = null;
 let cancelled = false;
 let result = null;
@@ -1352,7 +1409,6 @@ async function build() {
   const g = cv.getContext('2d');
   g.fillStyle = '#000';
   g.fillRect(0, 0, W, H);
-  clips.forEach((c) => overlayFor(c, W, H));
 
   // 描いたコマだけを録画に送る（対応ブラウザ）。非対応なら毎秒30コマで自動取り込み
   const manual = !!(window.CanvasCaptureMediaStreamTrack && 'requestFrame' in CanvasCaptureMediaStreamTrack.prototype);
@@ -1374,9 +1430,10 @@ async function build() {
   const look = currentLook();
   let current = null, currentIndex = 0, seg = null;
   let drawing = true, lastPaint = 0;
-  // 映像のフレームが用意できていないときは描かない（黒いコマが録画されるのを防ぐ）
+  // 映像のフレームが用意できていないときは描かない（黒いコマが録画されるのを防ぐ）。
+  // 助走中（seg がまだない）も描かない：助走の映像が録画に1コマ混ざると、切り替えでチカッと光って見えるため
   const paint = () => {
-    if (rv.readyState < 2 || !current) return;
+    if (rv.readyState < 2 || !current || !seg) return;
     renderFrame(g, rv, rv.videoWidth, rv.videoHeight, W, H, look);
     g.drawImage(overlayFor(current, W, H).canvas, 0, 0);
     // 切り替え効果
@@ -1402,6 +1459,7 @@ async function build() {
   requestAnimationFrame(draw);
 
   let recStarted = false;
+  building = true;
   try {
     for (let i = 0; i < clips.length && !cancelled; i++) {
       const c = clips[i];
@@ -1424,6 +1482,9 @@ async function build() {
       });
       // 次のクリップの準備中（読み込み・助走）は録画しない
       if (rec.state === 'recording' && rec.pause) rec.pause();
+      seg = null;
+      // 高画質の文字・日付の画像はメモリを使うので、使い終わったら捨てる
+      if (c._ov) delete c._ov[`${W}x${H}`];
     }
   } catch (e) {
     console.error(e);
@@ -1436,8 +1497,10 @@ async function build() {
     await stopped.catch(() => {});
     if (audioDest) mediaSrc.disconnect(audioDest);
     stream.getTracks().forEach((t) => t.stop());
-    rv.pause();
+    releaseVideo(rv);
     wakeLock?.release?.().catch(() => {});
+    building = false;
+    runThumbQueue();
   }
 
   if (cancelled) { $('#renderer').classList.remove('show'); return; }
