@@ -129,6 +129,9 @@
   .pane.on { display: grid; }
   .pane .row { flex-wrap: wrap; row-gap: 8px; }
   [hidden] { display: none !important; }
+  .listbtns { display: flex; gap: 6px; flex: none; }
+  .listbtns button { white-space: nowrap; }
+  .listhead { gap: 8px; }
   .lookmode { justify-content: stretch; }
   .lookmode button { flex: 1; }
   .lookpart { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
@@ -203,6 +206,11 @@
   </button>
   <input type="file" id="fileInput" accept="video/*" multiple>
 
+  <div class="notice" id="restoreNotice" hidden>
+    <span id="restoreText"></span>
+    <button id="restoreClose" aria-label="閉じる">✕</button>
+  </div>
+
   <div class="notice" id="hiddenNotice" style="display:none">
     <span id="hiddenText"></span>
     <button id="hiddenUse">これも使う</button>
@@ -210,7 +218,10 @@
 
   <div class="listhead">
     <span id="listInfo">クリップ</span>
-    <button id="sortBtn">日付順に並べる</button>
+    <span class="listbtns">
+      <button id="resetBtn">最初から</button>
+      <button id="sortBtn">日付順</button>
+    </span>
   </div>
   <ol class="clips" id="clipList"></ol>
 
@@ -458,7 +469,7 @@ function guessDate(file) {
 
 const segLen = (c) => Math.min(state.seconds, c.duration || state.seconds);
 const maxStart = (c) => Math.max(0, (c.duration || 0) - state.seconds);
-const readyClips = () => state.clips.filter((c) => c.duration > 0);
+const readyClips = () => state.clips.filter((c) => c.duration > 0 && !c.missing);
 
 function waitEvent(el, ev, timeout = 15000) {
   return new Promise((resolve, reject) => {
@@ -833,17 +844,181 @@ probeVideo.muted = true;
 probeVideo.preload = 'metadata';
 let probing = Promise.resolve();
 
+// ---------- 自動保存 ----------
+// Androidはほかのアプリに切り替えている間にページを閉じることがあるので、
+// 選んだ動画と編集内容をスマホの中（IndexedDB）に保存し、戻ってきたら元に戻す
+let dbPromise = null;
+function openDb() {
+  if (!dbPromise) {
+    dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('clip-diary', 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore('videos');
+        req.result.createObjectStore('project');
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return dbPromise;
+}
+
+async function idb(store, mode, fn) {
+  const db = await openDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const req = fn(tx.objectStore(store));
+    tx.oncomplete = () => resolve(req?.result);
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+const SAVE_KEYS = ['id', 'name', 'size', 'type', 'lastModified', 'duration', 'start', 'date', 'thumb', 'thumbStart',
+  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored'];
+let restored = false;
+let saveTimer = 0;
+let persistAsked = false;
+
+function scheduleSave() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveProject, 400);
+}
+
+async function saveProject() {
+  clearTimeout(saveTimer);
+  if (!restored) return; // 復元が終わる前に空の状態で上書きしない
+  const pack = (c, hidden) => {
+    const o = { hidden };
+    SAVE_KEYS.forEach((k) => { o[k] = c[k]; });
+    return o;
+  };
+  const data = { clips: [...state.clips.map((c) => pack(c, false)), ...state.hidden.map((c) => pack(c, true))] };
+  try {
+    await idb('project', 'readwrite', (s) => s.put(data, 'current'));
+  } catch (e) {
+    console.warn('save', e);
+  }
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveProject(); });
+window.addEventListener('pagehide', () => saveProject());
+setInterval(() => { if (editorOpen) scheduleSave(); }, 3000);
+
+// 動画ファイルそのものを保存し、以後は保存したほうを使う
+// （選んだ元のファイルは、アプリを切り替えると読めなくなることがあるため）
+// 大きな動画を同時にいくつも書き込むと重いので、1本ずつ順番に保存する
+let storeChain = Promise.resolve();
+function storeVideo(c) {
+  storeChain = storeChain.then(() => storeVideoNow(c));
+  return storeChain;
+}
+
+async function storeVideoNow(c) {
+  if (c.deleted) return; // 保存前に削除された
+  if (!persistAsked) {
+    persistAsked = true;
+    navigator.storage?.persist?.().catch(() => {});
+  }
+  try {
+    await idb('videos', 'readwrite', (s) => s.put(c.file, c.id));
+    const blob = await idb('videos', 'readonly', (s) => s.get(c.id));
+    if (blob) {
+      const old = c.url;
+      c.file = blob;
+      c.url = URL.createObjectURL(blob);
+      c.stored = true;
+      const inUse = [ev, rv, thumbVideo, stripVideo, probeVideo].some((v) => v.dataset.src === old);
+      if (!inUse) URL.revokeObjectURL(old);
+    }
+  } catch (e) {
+    // 容量不足などで保存できなかった。動画は今のまま使い、復元時は選び直してもらう
+    console.warn('store', c.name, e);
+    c.stored = false;
+  }
+  scheduleSave();
+}
+
+async function restoreProject() {
+  let count = 0;
+  const missing = [];
+  try {
+    const data = await idb('project', 'readonly', (s) => s.get('current'));
+    for (const o of data?.clips || []) {
+      const c = { ...o, file: null, url: '', error: '', missing: false };
+      delete c.hidden;
+      const blob = o.stored ? await idb('videos', 'readonly', (s) => s.get(o.id)).catch(() => null) : null;
+      if (blob) {
+        c.file = blob;
+        c.url = URL.createObjectURL(blob);
+      } else {
+        c.missing = true;
+        c.stored = false;
+        missing.push(c);
+      }
+      uid = Math.max(uid, c.id);
+      (o.hidden ? state.hidden : state.clips).push(c);
+      if (!c.missing && (!c.duration || !c.thumb)) enqueueThumb(c);
+      count++;
+    }
+  } catch (e) {
+    console.warn('restore', e);
+  }
+  restored = true;
+  if (count) {
+    $('#restoreNotice').hidden = false;
+    $('#restoreText').textContent = missing.length
+      ? `前回の作業を元に戻しました（${count}本）。${missing.length}本は動画をもう一度選んでください。同じ動画を選ぶと、編集内容がそのまま戻ります。`
+      : `前回の作業を元に戻しました（${count}本）。`;
+  }
+  renderNotice();
+  renderList();
+}
+
+// 選び直した動画が、元に戻せなかった動画と同じなら、そこへはめ込む（名前と大きさで判定）
+function fillMissing(file) {
+  const c = [...state.clips, ...state.hidden].find((x) => x.missing && x.name === file.name && x.size === file.size);
+  if (!c) return false;
+  c.file = file;
+  c.url = URL.createObjectURL(file);
+  c.missing = false;
+  if (!c.thumb || !c.duration) enqueueThumb(c);
+  storeVideo(c);
+  return true;
+}
+
+async function clearProject() {
+  [...state.clips, ...state.hidden].forEach((c) => {
+    c.deleted = true;
+    if (c.url) URL.revokeObjectURL(c.url);
+  });
+  state.clips = [];
+  state.hidden = [];
+  thumbQueue.length = 0;
+  try {
+    await idb('videos', 'readwrite', (s) => s.clear());
+    await idb('project', 'readwrite', (s) => s.clear());
+  } catch (e) {
+    console.warn('clear', e);
+  }
+  $('#restoreNotice').hidden = true;
+  renderNotice();
+  renderList();
+}
+
 function addFiles(files) {
   const list = [...files].filter((f) => f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm|3gp)$/i.test(f.name));
   const job = async () => {
     for (let i = 0; i < list.length; i++) {
       const file = list[i];
       $('#pickLabel').textContent = `読み込み中… ${i + 1} / ${list.length}`;
+      if (fillMissing(file)) { renderList(); continue; }
       const c = {
-        id: ++uid, file, name: file.name, url: URL.createObjectURL(file),
+        id: ++uid, file, name: file.name, size: file.size, type: file.type, lastModified: file.lastModified,
+        url: URL.createObjectURL(file),
         duration: 0, start: 0, date: guessDate(file), thumb: '', strip: null, confirmed: false, error: '', text: null,
-        orient: null, keep: false,
+        orient: null, keep: false, stored: false, missing: false,
       };
+      storeVideo(c);
       try {
         await loadSrc(probeVideo, c.url);
         c.orient = orientOf(probeVideo.videoWidth, probeVideo.videoHeight);
@@ -873,6 +1048,7 @@ let renderPending = false;
 
 function renderList() {
   if (drag) { renderPending = true; return; }
+  scheduleSave();
   const ol = $('#clipList');
   const ready = readyClips();
   const total = ready.reduce((s, c) => s + segLen(c), 0);
@@ -880,6 +1056,7 @@ function renderList() {
   $('#count').textContent = state.clips.length ? `${state.clips.length}本` : '';
   $('#listInfo').textContent = state.clips.length ? `クリップ ${state.clips.length}本 ・ 完成時 約${Math.round(total)}秒` : 'クリップ';
   $('#sortBtn').style.visibility = state.clips.length > 1 ? 'visible' : 'hidden';
+  $('#resetBtn').style.visibility = state.clips.length || state.hidden.length ? 'visible' : 'hidden';
   $('#pickBtn').classList.toggle('compact', state.clips.length > 0);
 
   const main = $('#mainBtn');
@@ -899,7 +1076,8 @@ function renderList() {
   }
   ol.innerHTML = state.clips.map((c, i) => {
     let sub, bar = '';
-    if (c.error) sub = `<span class="err">${c.error}</span>`;
+    if (c.missing) sub = `<span class="warn">動画をもう一度選んでください（${escapeHtml(c.name)}）</span>`;
+    else if (c.error) sub = `<span class="err">${c.error}</span>`;
     else if (!c.duration) sub = '読み込み中…';
     else {
       sub = c.duration < state.seconds
@@ -932,8 +1110,14 @@ $('#clipList').addEventListener('click', (e) => {
   const id = +btn.closest('.clip').dataset.id;
   const i = state.clips.findIndex((c) => c.id === id);
   const c = state.clips[i];
-  if (btn.dataset.act === 'edit' && c.duration) openEditor(c);
-  if (btn.dataset.act === 'del') { URL.revokeObjectURL(c.url); state.clips.splice(i, 1); }
+  if (btn.dataset.act === 'edit' && c.duration && !c.missing) openEditor(c);
+  if (btn.dataset.act === 'edit' && c.missing) $('#fileInput').click();
+  if (btn.dataset.act === 'del') {
+    if (c.url) URL.revokeObjectURL(c.url);
+    c.deleted = true;
+    state.clips.splice(i, 1);
+    idb('videos', 'readwrite', (s) => s.delete(c.id)).catch(() => {});
+  }
   renderList();
 });
 
@@ -999,8 +1183,13 @@ const endListDrag = () => {
 $('#clipList').addEventListener('pointerup', endListDrag);
 $('#clipList').addEventListener('pointercancel', endListDrag);
 
+$('#restoreClose').addEventListener('click', () => { $('#restoreNotice').hidden = true; });
+$('#resetBtn').addEventListener('click', () => {
+  if (confirm('選んだ動画と編集内容をすべて消して、最初からやり直しますか？\n（スマホの中の元の動画は消えません）')) clearProject();
+});
+
 $('#sortBtn').addEventListener('click', () => {
-  state.clips.sort((a, b) => a.date.localeCompare(b.date) || a.file.lastModified - b.file.lastModified);
+  state.clips.sort((a, b) => a.date.localeCompare(b.date) || (a.lastModified || 0) - (b.lastModified || 0));
   renderList();
 });
 
@@ -1758,6 +1947,7 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 
 renderNotice();
 renderList();
+restoreProject();
 </script>
 </body>
 </html>
