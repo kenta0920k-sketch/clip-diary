@@ -172,16 +172,16 @@
   .day, .atile { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
   .calviewseg { justify-content: stretch; }
   .calviewseg button { flex: 1; }
-  .album { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .album { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
   .atile {
-    position: relative; aspect-ratio: 3 / 4; border: 0; padding: 0; border-radius: 14px; overflow: hidden;
+    position: relative; aspect-ratio: 3 / 4; border: 0; padding: 0; border-radius: 10px; overflow: hidden;
     background: #1c1c1c center / cover no-repeat; text-align: left;
   }
   .atile .lbl {
-    position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 10px 8px; color: #fff; font-size: 14px; font-weight: 700;
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 18px 7px 6px; color: #fff; font-size: 12px; font-weight: 700;
     background: linear-gradient(to top, rgba(0,0,0,.75), transparent);
   }
-  .atile .lbl small { display: block; font-size: 11px; font-weight: 400; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .atile .lbl small { display: block; font-size: 10px; font-weight: 400; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .atile .cnt { position: absolute; right: 8px; top: 8px; background: rgba(0,0,0,.7); color: #fff; border-radius: 8px; padding: 1px 7px; font-size: 11px; }
   .album .empty { grid-column: 1 / -1; text-align: center; color: var(--sub); font-size: 13px; padding: 24px 0; }
   .peek {
@@ -1046,7 +1046,7 @@ async function makeThumb(c) {
   // 一度再生しないとフレームを描けないブラウザがある
   try { await v.play(); v.pause(); } catch (_) {}
   const cv = document.createElement('canvas');
-  cv.width = 240; cv.height = 320; // アルバムで大きく見せてもきれいなように
+  cv.width = 360; cv.height = 480; // アルバムで大きく見せてもきれいなように（Galaxyの細かい画面に合わせる）
   const g = cv.getContext('2d');
   // 使う区間の中ほどをサムネイルにする。真っ黒なら（デコーダーの準備待ちや、映像のない区間）少し待つ・別の位置を試す
   const last = Math.max(0, c.duration - 0.05);
@@ -1059,7 +1059,8 @@ async function makeThumb(c) {
       if (!isBlank(g, cv.width, cv.height)) break draw;
     }
   }
-  c.thumb = cv.toDataURL('image/jpeg', 0.7);
+  c.thumb = cv.toDataURL('image/jpeg', 0.8);
+  c.thumbV = THUMB_VERSION;
   c.thumbStart = c.start;
   // 向きを先に調べられなかった動画は、ここで判定する
   if (!c.orient) {
@@ -1142,7 +1143,9 @@ async function idb(store, mode, fn) {
 }
 
 const SAVE_KEYS = ['id', 'name', 'size', 'type', 'lastModified', 'duration', 'start', 'date', 'thumb', 'thumbStart',
-  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored', 'dateSource', 'dateEdited', 'crop'];
+  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored', 'dateSource', 'dateEdited', 'crop', 'thumbV'];
+// サムネイルの作り方を変えたら上げる（古いサムネイルは自動で作り直す）
+const THUMB_VERSION = 3;
 let restored = false;
 let saveTimer = 0;
 let persistAsked = false;
@@ -1224,7 +1227,7 @@ async function restoreProject() {
       }
       uid = Math.max(uid, c.id);
       (o.hidden ? state.hidden : state.clips).push(c);
-      if (!c.missing && (!c.duration || !c.thumb)) enqueueThumb(c);
+      if (!c.missing && (!c.duration || !c.thumb || c.thumbV !== THUMB_VERSION)) enqueueThumb(c);
       count++;
     }
   } catch (e) {
@@ -1428,7 +1431,7 @@ $('#calendar').addEventListener('pointerdown', (e) => {
   pressTimer = setTimeout(() => {
     suppressClick = true;
     navigator.vibrate?.(15);
-    openPeek(c);
+    openPeek(b.dataset.date);
   }, 450);
 });
 $('#calendar').addEventListener('pointermove', (e) => {
@@ -1449,35 +1452,67 @@ $('#calendar').addEventListener('click', (e) => {
   else if (!c) pickForDate(b.dataset.date);
 });
 
-// その場で再生：できあがりと同じ見た目（色味・画角・文字・日付）で、選んだ3秒をくり返す
+// その場で再生：その日の動画を全部、使う部分（3秒）ずつ順につないでくり返す。
+// その日が1本だけのときは、その動画を長め（約10秒）に流す。見た目はできあがりと同じ（色味・画角・文字・日付）
+const PEEK_SINGLE = 10;
 const pv = $('#peekVideo');
 const pcv = $('#peekCanvas');
 const pg = pcv.getContext('2d');
 let peekClip = null;
-function openPeek(c) {
-  peekClip = c;
+let peekList = [], peekIndex = 0, peekSwitching = false;
+
+function openPeek(date) {
+  const clips = (clipsByDate().get(date) || []).filter((c) => c.duration && !c.missing);
+  if (!clips.length) return;
+  if (clips.length === 1) {
+    // 1本だけ：使う部分を中心に、約10秒
+    const c = clips[0];
+    const len = Math.min(PEEK_SINGLE, c.duration);
+    const start = clamp(c.start + segLen(c) / 2 - len / 2, 0, Math.max(0, c.duration - len));
+    peekList = [{ c, start, len }];
+  } else {
+    peekList = clips.map((c) => ({ c, start: c.start, len: segLen(c) }));
+  }
   const [W, H] = SIZES.std[state.aspect];
   pcv.width = W / 2;
   pcv.height = H / 2;
-  const [, mm, dd] = c.date.split('-').map(Number);
-  $('#peekLabel').textContent = `${mm}月${dd}日（${WEEK[new Date(+c.date.slice(0, 4), mm - 1, dd).getDay()]}）`;
+  const [, mm, dd] = date.split('-').map(Number);
+  $('#peekLabel').dataset.base = `${mm}月${dd}日（${WEEK[new Date(+date.slice(0, 4), mm - 1, dd).getDay()]}）`;
   $('#peek').hidden = false;
   pv.muted = state.videoVol === 0;
   pv.volume = state.videoVol / 100;
-  pv.dataset.src = c.url;
-  pv.src = c.url;
-  pv.currentTime = c.start;
-  pv.play().catch(() => { pv.muted = true; pv.play().catch(() => {}); });
+  playPeekItem(0);
   requestAnimationFrame(peekLoop);
 }
+
+async function playPeekItem(i) {
+  peekIndex = i;
+  const it = peekList[i];
+  peekClip = it.c;
+  $('#peekLabel').textContent = peekList.length > 1
+    ? `${$('#peekLabel').dataset.base}　${i + 1} / ${peekList.length}本`
+    : $('#peekLabel').dataset.base;
+  peekSwitching = true;
+  try {
+    await loadSrc(pv, it.c.url);
+    await seek(pv, it.start);
+  } catch (e) {
+    console.warn('peek', e);
+  }
+  peekSwitching = false;
+  if (!peekClip) return; // 途中で閉じた
+  pv.play().catch(() => { pv.muted = true; pv.play().catch(() => {}); });
+}
+
 function peekLoop() {
   const c = peekClip;
   if (!c) return;
-  if (pv.currentTime >= c.start + segLen(c) - 0.01 || pv.ended) {
-    pv.currentTime = c.start;
-    pv.play().catch(() => {});
+  const it = peekList[peekIndex];
+  if (!peekSwitching && (pv.currentTime >= it.start + it.len - 0.01 || pv.ended)) {
+    if (peekList.length > 1) playPeekItem((peekIndex + 1) % peekList.length); // 次の動画へ
+    else { pv.currentTime = it.start; pv.play().catch(() => {}); } // 1本ならくり返す
   }
-  if (pv.readyState >= 2) {
+  if (pv.readyState >= 2 && !peekSwitching) {
     renderFrame(pg, pv, pv.videoWidth, pv.videoHeight, pcv.width, pcv.height, { ...currentLook(), crop: c.crop });
     pg.drawImage(overlayFor(c, pcv.width, pcv.height).canvas, 0, 0);
   }
@@ -1485,6 +1520,7 @@ function peekLoop() {
 }
 function closePeek() {
   peekClip = null;
+  peekList = [];
   releaseVideo(pv);
   $('#peek').hidden = true;
 }
