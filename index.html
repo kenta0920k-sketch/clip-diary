@@ -129,6 +129,14 @@
   .pane.on { display: grid; }
   .pane .row { flex-wrap: wrap; row-gap: 8px; }
   [hidden] { display: none !important; }
+  .toast {
+    position: fixed; left: 16px; right: 16px; top: calc(16px + env(safe-area-inset-top)); z-index: 30;
+    max-width: 440px; margin: 0 auto; padding: 12px 16px; border-radius: 14px;
+    background: #2b2b2b; color: var(--text); border: 1px solid #444; box-shadow: 0 8px 24px rgba(0,0,0,.5);
+    font-size: 14px; line-height: 1.6;
+  }
+  .toast b { color: var(--ok); }
+  .sharenote { text-align: left; background: #1c1c1c; border-radius: 10px; padding: 10px 12px; }
   .listbtns { display: flex; gap: 6px; flex: none; }
   .listbtns button { white-space: nowrap; }
   .listhead { gap: 8px; }
@@ -369,6 +377,7 @@
   </div>
   <div class="panel" id="resultPanel" style="display:none">
     <div class="label"><span id="resultInfo"></span></div>
+    <p class="note sharenote" id="shareNote" hidden></p>
     <button class="primary" id="shareBtn">保存・共有</button>
     <div class="btnrow">
       <button class="secondary" id="downloadBtn">ダウンロード</button>
@@ -376,6 +385,8 @@
     </div>
   </div>
 </div>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
 <video id="editVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
 <video id="renderVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
@@ -402,7 +413,9 @@ const SIZES = {
   std: { '9:16': [720, 1280], '16:9': [1280, 720], '1:1': [720, 720] },
   high: { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080] },
 };
-const BITRATE = { std: 8_000_000, high: 16_000_000 };
+const BITRATE = { std: 6_000_000, high: 12_000_000 };
+// Android の Chrome は、共有画面に渡せるファイルを 50MB までに制限している
+const SHARE_LIMIT = 50 * 1024 * 1024;
 // 各クリップの少し手前から再生を始め、映像が滑らかに流れ出してから録画する（冒頭のカクつき対策）
 const PREROLL = 0.5;
 
@@ -1911,8 +1924,16 @@ async function build() {
   $('#renderPanel').style.display = 'none';
   $('#resultPanel').style.display = '';
   $('#resultInfo').textContent = `完成！ ${clips.length}本 ・ ${(blob.size / 1024 / 1024).toFixed(1)}MB（${ext}）`;
-  const canShare = navigator.canShare?.({ files: [new File([blob], name, { type })] });
-  $('#shareBtn').style.display = canShare ? '' : 'none';
+  const tooBig = blob.size > SHARE_LIMIT;
+  const canShare = !tooBig && navigator.canShare?.({ files: [new File([blob], name, { type })] });
+  $('#shareBtn').hidden = !canShare;
+  // 共有できないときは、ダウンロードをいちばん目立つボタンにする
+  $('#downloadBtn').className = canShare ? 'secondary' : 'primary';
+  $('#downloadBtn').textContent = 'ダウンロード';
+  $('#shareNote').hidden = !tooBig;
+  $('#shareNote').textContent = tooBig
+    ? `動画が大きい（${(blob.size / 1024 / 1024).toFixed(0)}MB）ため、スマホの共有画面には渡せません（上限50MB）。ダウンロードしてから、ギャラリーやSNSのアプリで共有してください。`
+    : '';
   out.play().catch(() => {});
 }
 
@@ -1922,7 +1943,10 @@ $('#shareBtn').addEventListener('click', async () => {
   try {
     await navigator.share({ files: [new File([result.blob], result.name, { type: result.type })] });
   } catch (e) {
-    if (e.name !== 'AbortError') alert(`共有できませんでした：${e.message}`);
+    if (e.name === 'AbortError') return; // 共有画面を閉じただけ
+    showToast('共有できませんでした。「ダウンロード」で保存してから、ギャラリーやSNSのアプリで共有してください。', 6000);
+    $('#shareBtn').hidden = true;
+    $('#downloadBtn').className = 'primary';
   }
 });
 
@@ -1933,7 +1957,18 @@ $('#downloadBtn').addEventListener('click', () => {
   document.body.appendChild(a);
   a.click();
   a.remove();
+  $('#downloadBtn').textContent = '✓ ダウンロード済み';
+  showToast(`<b>✓ ダウンロードしました</b><br>ギャラリーの「Download」に入っています（${result.name}）`, 5000);
 });
+
+function showToast(html, ms = 4000) {
+  const t = $('#toast');
+  t.innerHTML = html;
+  t.hidden = false;
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => { t.hidden = true; }, ms);
+}
+$('#toast').addEventListener('click', () => { $('#toast').hidden = true; });
 
 $('#closeResultBtn').addEventListener('click', () => {
   $('#renderer').classList.remove('show');
