@@ -137,6 +137,12 @@
   }
   .toast b { color: var(--ok); }
   .sharenote { text-align: left; background: #1c1c1c; border-radius: 10px; padding: 10px 12px; }
+  .bgmpick { display: flex; align-items: center; gap: 6px; min-width: 0; }
+  .bgmpick #bgmName { font-size: 13px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .bgmrow { flex-wrap: wrap; row-gap: 8px; }
+  .bgmbox { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; padding-top: 4px; border-top: 1px solid var(--line); }
+  #bgmTry { justify-self: start; }
+  #bgmInput { display: none; }
   .listbtns { display: flex; gap: 6px; flex: none; }
   .listbtns button { white-space: nowrap; }
   .listhead { gap: 8px; }
@@ -259,11 +265,43 @@
         <button data-val="std">標準 720p</button><button data-val="high">高画質 1080p</button>
       </div>
     </div>
-    <div class="row">
-      <label>音声</label>
-      <div class="seg" data-key="audio">
-        <button data-val="on">あり</button><button data-val="off">なし</button>
+  </section>
+
+  <h2>音</h2>
+  <section class="settings">
+    <label class="adj">
+      <span>動画の音量</span>
+      <input type="range" id="videoVol" min="0" max="100" step="1">
+      <output id="videoVolV"></output>
+    </label>
+    <div class="row bgmrow">
+      <label>BGM</label>
+      <div class="bgmpick">
+        <span id="bgmName">なし</span>
+        <button class="smallbtn" id="bgmPickBtn">曲を選ぶ</button>
+        <button class="smallbtn" id="bgmRemove" hidden>外す</button>
       </div>
+    </div>
+    <input type="file" id="bgmInput" accept="audio/*">
+    <div class="bgmbox" id="bgmControls" hidden>
+      <label class="adj">
+        <span>流し始め</span>
+        <input type="range" id="bgmStart" min="0" max="0" step="0.5">
+        <output id="bgmStartV"></output>
+      </label>
+      <button class="smallbtn" id="bgmTry">▶ ここから試聴</button>
+      <label class="adj">
+        <span>BGMの音量</span>
+        <input type="range" id="bgmVol" min="0" max="100" step="1">
+        <output id="bgmVolV"></output>
+      </label>
+      <div class="row">
+        <label>フェード</label>
+        <div class="seg" data-key="bgmFade">
+          <button data-val="on">あり</button><button data-val="off">なし</button>
+        </div>
+      </div>
+      <p class="note">曲は始まりの1秒でふわっと大きく、終わりの2秒でふわっと小さくなります（フェードありのとき）。曲が動画より短いときは、頭からくり返します。</p>
     </div>
   </section>
   <p class="note" style="margin-top:14px">色味・文字は、動画をタップして開く画面で選べます。</p>
@@ -272,7 +310,10 @@
 <div class="bottombar">
   <button class="primary" id="mainBtn" disabled>動画をつくる</button>
   <button class="link" id="buildAnywayBtn" style="display:none">選ばずにこのまま動画をつくる</button>
+  <button class="link" id="previewBtn" style="display:none">▶ 書き出す前にプレビュー</button>
 </div>
+
+<audio id="bgmAudio" preload="auto"></audio>
 
 <!-- 1本ずつ編集する画面 -->
 <div class="overlay" id="editor">
@@ -399,13 +440,18 @@ const $ = (s) => document.querySelector(s);
 
 // ---------- 設定 ----------
 const DEFAULTS = {
-  seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std', audio: 'on',
+  seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std',
+  videoVol: 100, bgmVol: 80, bgmStart: 0, bgmFade: 'on',
   look: 'none', grain: 'off', vignette: 'off', stamp: 'on', transition: 'cut',
   textStyle: { font: 'maru', color: '#ffffff', size: 0.07, style: 'shadow', x: 0.5, y: 0.78 },
   adjust: { bright: 0, contrast: 0, sat: 0, temp: 0, fade: 0 },
 };
 const state = { clips: [], ...structuredClone(DEFAULTS) };
 try { Object.assign(state, JSON.parse(localStorage.getItem('settings') || '{}')); } catch (_) {}
+// 以前の「音声：なし」は、動画の音量0として引き継ぐ
+if (state.audio === 'off') state.videoVol = 0;
+delete state.audio;
+state.bgm = null; // { name, blob, duration, buffer }
 const saveSettings = () => {
   const s = {};
   for (const k of Object.keys(DEFAULTS)) s[k] = state[k];
@@ -1013,6 +1059,8 @@ async function clearProject() {
   try {
     await idb('videos', 'readwrite', (s) => s.clear());
     await idb('project', 'readwrite', (s) => s.clear());
+    // BGM は「最初から」でも残しておく
+    if (state.bgm) await idb('videos', 'readwrite', (s) => s.put({ blob: state.bgm.blob, name: state.bgm.name }, 'bgm'));
   } catch (e) {
     console.warn('clear', e);
   }
@@ -1085,6 +1133,7 @@ function renderList() {
     main.textContent = ready.length ? `動画をつくる（${ready.length}本・約${Math.round(total)}秒）` : '動画をつくる';
   }
   $('#buildAnywayBtn').style.display = todo.length ? '' : 'none';
+  $('#previewBtn').style.display = !todo.length && ready.length ? '' : 'none';
 
   if (!state.clips.length) {
     ol.innerHTML = '<li class="empty">日常の動画を選ぶと、それぞれ好きな3秒を切り出して<br>1本の動画につなげます。</li>';
@@ -1771,14 +1820,17 @@ function setProgress(i, n, frac) {
   $('#renderText').textContent = `${Math.min(i + 1, n)} / ${n} 本目を書き出し中`;
 }
 
-async function build() {
+// preview = true のときは録画せず、画面と音だけ再生する（書き出す前の確認用）
+async function build(preview = false) {
   const clips = readyClips();
   if (!clips.length) return;
-  if (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream) {
+  if (!preview && (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream)) {
     alert('このブラウザは動画の書き出しに対応していません。最新のChromeかSafariでお試しください。');
     return;
   }
-  const withAudio = state.audio === 'on';
+  const videoVol = state.videoVol / 100;
+  const bgmOn = !!state.bgm;
+  const withAudio = videoVol > 0 || bgmOn;
 
   // ここまで await なし：タップ直後のうちに再生と音声を解禁しておく
   if (withAudio && !audioCtx) {
@@ -1787,25 +1839,41 @@ async function build() {
     mediaSrc = audioCtx.createMediaElementSource(rv);
   }
   if (audioCtx) audioCtx.resume();
-  rv.muted = !withAudio;
+  stopBgmTry();
+  rv.muted = videoVol === 0;
   rv.dataset.src = clips[0].url;
   rv.src = clips[0].url;
   const unlocked = rv.play().then(() => rv.pause()).catch(() => {});
 
   cancelled = false;
-  result = null;
+  if (!preview) result = null;
   $('#renderStage').innerHTML = '<canvas id="renderCanvas"></canvas>';
   $('#renderPanel').style.display = '';
   $('#resultPanel').style.display = 'none';
   $('#renderer').classList.add('show');
   $('#renderText').textContent = '準備中…';
+  $('#renderPanel .note').textContent = preview
+    ? 'プレビュー中です（書き出しはしません）。'
+    : '書き出し中は画面を閉じたり、他のアプリに切り替えないでください。';
+  $('#cancelBtn').textContent = preview ? 'プレビューをやめる' : 'キャンセル';
 
   let wakeLock = null;
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch (_) {}
   await unlocked;
   await Promise.all(clips.map((c) => ensureFont(c.text)));
+  let bgmBuffer = null;
+  if (bgmOn) {
+    $('#renderText').textContent = '曲を読み込み中…';
+    try {
+      bgmBuffer = await getBgmBuffer();
+    } catch (e) {
+      console.warn('bgm', e);
+      showToast('曲を読み込めなかったので、BGMなしで続けます。', 5000);
+    }
+  }
 
-  const [W, H] = SIZES[state.quality][state.aspect];
+  // プレビューは軽くするため標準画質で描く
+  const [W, H] = SIZES[preview ? 'std' : state.quality][state.aspect];
   const cv = $('#renderCanvas');
   cv.width = W; cv.height = H;
   const g = cv.getContext('2d');
@@ -1813,21 +1881,62 @@ async function build() {
   g.fillRect(0, 0, W, H);
 
   // 描いたコマだけを録画に送る（対応ブラウザ）。非対応なら毎秒30コマで自動取り込み
-  const manual = !!(window.CanvasCaptureMediaStreamTrack && 'requestFrame' in CanvasCaptureMediaStreamTrack.prototype);
-  const stream = cv.captureStream(manual ? 0 : 30);
-  const vtrack = stream.getVideoTracks()[0];
-  let audioDest = null;
-  if (withAudio) {
-    audioDest = audioCtx.createMediaStreamDestination();
-    mediaSrc.connect(audioDest);
-    audioDest.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
+  const manual = !preview && !!(window.CanvasCaptureMediaStreamTrack && 'requestFrame' in CanvasCaptureMediaStreamTrack.prototype);
+  const stream = preview ? null : cv.captureStream(manual ? 0 : 30);
+  const vtrack = stream?.getVideoTracks()[0];
+
+  // 音のつなぎ方：動画の音 → 音量 → 出力、BGM → 音量（クリップごとにフェード）→ 出力
+  // 出力は、書き出しなら録画へ、プレビューならスピーカーへ
+  let audioOut = null, videoGain = null;
+  if (withAudio && audioCtx) {
+    audioOut = preview ? audioCtx.destination : audioCtx.createMediaStreamDestination();
+    videoGain = audioCtx.createGain();
+    videoGain.gain.value = videoVol;
+    mediaSrc.connect(videoGain).connect(audioOut);
+    if (!preview) audioOut.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
   }
 
   const mime = pickMime();
-  const rec = new MediaRecorder(stream, { ...(mime && { mimeType: mime }), videoBitsPerSecond: BITRATE[state.quality] });
+  const rec = preview
+    ? null
+    : new MediaRecorder(stream, { ...(mime && { mimeType: mime }), videoBitsPerSecond: BITRATE[state.quality] });
   const chunks = [];
-  rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
-  const stopped = new Promise((r) => { rec.onstop = r; });
+  let stopped = Promise.resolve();
+  if (rec) {
+    rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+    stopped = new Promise((r) => { rec.onstop = r; });
+  }
+
+  // BGM：録画している区間だけ曲を流す。曲の位置は「録画した長さ」でつなげるので、動画と曲がずれない
+  const total = clips.reduce((s, c) => s + segLen(c), 0);
+  let elapsed = 0;
+  let bgmNode = null;
+  const bgmGainAt = (t) => {
+    const v = state.bgmVol / 100;
+    if (state.bgmFade !== 'on') return v;
+    return v * clamp(Math.min(t / 1.0, (total - t) / 2.0), 0, 1); // 始まり1秒・終わり2秒でフェード
+  };
+  const startBgm = (dur) => {
+    if (!bgmBuffer || !audioOut) return;
+    const node = audioCtx.createBufferSource();
+    node.buffer = bgmBuffer;
+    node.loop = true; // 曲が動画より短いときは頭からくり返す
+    const segGain = audioCtx.createGain();
+    const curve = new Float32Array(32).map((_, k) => bgmGainAt(elapsed + (dur * k) / 31));
+    const now = audioCtx.currentTime;
+    segGain.gain.setValueCurveAtTime(curve, now, Math.max(0.05, dur));
+    node.connect(segGain).connect(audioOut);
+    node.start(now, (state.bgmStart + elapsed) % bgmBuffer.duration);
+    node.segGain = segGain;
+    bgmNode = node;
+  };
+  const stopBgm = () => {
+    if (!bgmNode) return;
+    try { bgmNode.stop(); } catch (_) {}
+    bgmNode.disconnect();
+    bgmNode.segGain.disconnect();
+    bgmNode = null;
+  };
 
   const look = currentLook();
   let current = null, currentIndex = 0, seg = null;
@@ -1850,7 +1959,7 @@ async function build() {
       g.fillStyle = `rgba(${color},${Math.min(1, a)})`;
       g.fillRect(0, 0, W, H);
     }
-    if (manual) vtrack.requestFrame();
+    if (manual) vtrack?.requestFrame();
   };
   // 画面のリフレッシュ（120Hzなど）ごとではなく、最大30コマ/秒で描く（重くならないように）
   const draw = (now) => {
@@ -1877,13 +1986,18 @@ async function build() {
           seg = { start, end };
           paint();
           lastPaint = performance.now();
-          if (!recStarted) { rec.start(1000); recStarted = true; }
-          else if (rec.state === 'paused') rec.resume();
+          if (rec) {
+            if (!recStarted) { rec.start(1000); recStarted = true; }
+            else if (rec.state === 'paused') rec.resume();
+          }
+          startBgm(end - start);
         },
         onTick: (f) => setProgress(i, clips.length, f),
       });
-      // 次のクリップの準備中（読み込み・助走）は録画しない
-      if (rec.state === 'recording' && rec.pause) rec.pause();
+      // 次のクリップの準備中（読み込み・助走）は録画しない。曲も止めて、次のクリップで続きから流す
+      stopBgm();
+      if (rec?.state === 'recording' && rec.pause) rec.pause();
+      if (seg) elapsed += seg.end - seg.start;
       seg = null;
       // 高画質の文字・日付の画像はメモリを使うので、使い終わったら捨てる
       if (c._ov) delete c._ov[`${W}x${H}`];
@@ -1894,18 +2008,28 @@ async function build() {
     cancelled = true;
   } finally {
     drawing = false;
-    if (rec.state !== 'inactive') rec.stop();
-    else rec.onstop?.();
+    stopBgm();
+    if (rec) {
+      if (rec.state !== 'inactive') rec.stop();
+      else rec.onstop?.();
+    }
     await stopped.catch(() => {});
-    if (audioDest) mediaSrc.disconnect(audioDest);
-    stream.getTracks().forEach((t) => t.stop());
+    if (videoGain) {
+      mediaSrc.disconnect(videoGain);
+      videoGain.disconnect();
+    }
+    stream?.getTracks().forEach((t) => t.stop());
     releaseVideo(rv);
     wakeLock?.release?.().catch(() => {});
     building = false;
     runThumbQueue();
   }
 
-  if (cancelled) { $('#renderer').classList.remove('show'); return; }
+  if (cancelled || preview) {
+    $('#renderer').classList.remove('show');
+    if (preview && !cancelled) showToast('プレビューが終わりました。よければ「動画をつくる」で書き出してください。', 4000);
+    return;
+  }
   if (!chunks.length) {
     alert('書き出しに失敗しました。もう一度お試しください。');
     $('#renderer').classList.remove('show');
@@ -1951,6 +2075,124 @@ async function build() {
     : '';
   out.play().catch(() => {});
 }
+
+// ---------- BGM ----------
+const bgmAudio = $('#bgmAudio');
+let bgmTryTimer = 0;
+const fmtMS = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+
+function renderBgm() {
+  const b = state.bgm;
+  $('#bgmName').textContent = b ? b.name : 'なし';
+  $('#bgmPickBtn').textContent = b ? '曲を変える' : '曲を選ぶ';
+  $('#bgmRemove').hidden = !b;
+  $('#bgmControls').hidden = !b;
+  $('#videoVol').value = state.videoVol;
+  $('#videoVolV').textContent = state.videoVol;
+  if (b) {
+    $('#bgmStart').max = Math.max(0, Math.floor(b.duration - 1));
+    $('#bgmStart').value = state.bgmStart;
+    $('#bgmStartV').textContent = fmtMS(state.bgmStart);
+    $('#bgmVol').value = state.bgmVol;
+    $('#bgmVolV').textContent = state.bgmVol;
+  }
+}
+
+async function setBgm(blob, name) {
+  const a = new Audio();
+  a.preload = 'metadata';
+  const url = URL.createObjectURL(blob);
+  a.src = url;
+  try {
+    await waitEvent(a, 'loadedmetadata', 10000);
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  if (!isFinite(a.duration) || a.duration <= 0) throw new Error('no duration');
+  if (state.bgm?.url) URL.revokeObjectURL(state.bgm.url);
+  state.bgm = { name, blob, duration: a.duration, buffer: null, url: URL.createObjectURL(blob) };
+  if (state.bgmStart >= a.duration) state.bgmStart = 0;
+}
+
+// 書き出しに使う曲のデータ（一度読み込んだら使い回す）
+async function getBgmBuffer() {
+  const b = state.bgm;
+  if (!b.buffer) b.buffer = await audioCtx.decodeAudioData(await b.blob.arrayBuffer());
+  return b.buffer;
+}
+
+function stopBgmTry() {
+  bgmAudio.pause();
+  clearTimeout(bgmTryTimer);
+  $('#bgmTry').textContent = '▶ ここから試聴';
+}
+
+$('#bgmPickBtn').addEventListener('click', () => $('#bgmInput').click());
+$('#bgmInput').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  e.target.value = '';
+  if (!f) return;
+  stopBgmTry();
+  try {
+    await setBgm(f, f.name);
+    state.bgmStart = 0;
+    saveSettings();
+    idb('videos', 'readwrite', (s) => s.put({ blob: f, name: f.name }, 'bgm')).catch((err) => console.warn('bgm save', err));
+  } catch (err) {
+    console.warn('bgm', err);
+    showToast('この曲は読み込めませんでした。mp3 や m4a などの音楽ファイルを選んでください。', 5000);
+  }
+  renderBgm();
+});
+
+$('#bgmRemove').addEventListener('click', () => {
+  stopBgmTry();
+  if (state.bgm?.url) URL.revokeObjectURL(state.bgm.url);
+  state.bgm = null;
+  idb('videos', 'readwrite', (s) => s.delete('bgm')).catch(() => {});
+  renderBgm();
+});
+
+$('#bgmTry').addEventListener('click', () => {
+  if (!bgmAudio.paused) { stopBgmTry(); return; }
+  if (bgmAudio.dataset.src !== state.bgm.url) {
+    bgmAudio.src = state.bgm.url;
+    bgmAudio.dataset.src = state.bgm.url;
+  }
+  bgmAudio.currentTime = state.bgmStart;
+  bgmAudio.volume = state.bgmVol / 100;
+  bgmAudio.play().catch(() => {});
+  $('#bgmTry').textContent = '■ 試聴をとめる';
+  bgmTryTimer = setTimeout(stopBgmTry, 15000);
+});
+
+$('#bgmStart').addEventListener('input', (e) => {
+  state.bgmStart = +e.target.value;
+  $('#bgmStartV').textContent = fmtMS(state.bgmStart);
+  if (!bgmAudio.paused) bgmAudio.currentTime = state.bgmStart;
+});
+$('#bgmVol').addEventListener('input', (e) => {
+  state.bgmVol = +e.target.value;
+  $('#bgmVolV').textContent = state.bgmVol;
+  bgmAudio.volume = state.bgmVol / 100;
+});
+$('#videoVol').addEventListener('input', (e) => {
+  state.videoVol = +e.target.value;
+  $('#videoVolV').textContent = state.videoVol;
+});
+['bgmStart', 'bgmVol', 'videoVol'].forEach((id) => $(`#${id}`).addEventListener('change', saveSettings));
+
+async function restoreBgm() {
+  try {
+    const o = await idb('videos', 'readonly', (s) => s.get('bgm'));
+    if (o?.blob) await setBgm(o.blob, o.name);
+  } catch (e) {
+    console.warn('bgm restore', e);
+  }
+  renderBgm();
+}
+
+$('#previewBtn').addEventListener('click', () => build(true));
 
 // ---------- MP4の組み直し ----------
 // Chrome の録画（MediaRecorder）が作る MP4 は細切れ形式で、全体の長さが 0 などになっている。
@@ -2077,7 +2319,9 @@ if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.
 
 renderNotice();
 renderList();
+renderBgm();
 restoreProject();
+restoreBgm();
 </script>
 </body>
 </html>
