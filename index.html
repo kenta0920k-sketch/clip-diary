@@ -169,6 +169,27 @@
   .day.today { outline: 2px solid var(--accent); outline-offset: -2px; }
   .day.future { opacity: .35; }
   .day.empty { visibility: hidden; }
+  .day, .atile { -webkit-touch-callout: none; user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+  .calviewseg { justify-content: stretch; }
+  .calviewseg button { flex: 1; }
+  .album { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .atile {
+    position: relative; aspect-ratio: 3 / 4; border: 0; padding: 0; border-radius: 14px; overflow: hidden;
+    background: #1c1c1c center / cover no-repeat; text-align: left;
+  }
+  .atile .lbl {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 22px 10px 8px; color: #fff; font-size: 14px; font-weight: 700;
+    background: linear-gradient(to top, rgba(0,0,0,.75), transparent);
+  }
+  .atile .lbl small { display: block; font-size: 11px; font-weight: 400; opacity: .85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .atile .cnt { position: absolute; right: 8px; top: 8px; background: rgba(0,0,0,.7); color: #fff; border-radius: 8px; padding: 1px 7px; font-size: 11px; }
+  .album .empty { grid-column: 1 / -1; text-align: center; color: var(--sub); font-size: 13px; padding: 24px 0; }
+  .peek {
+    position: fixed; inset: 0; z-index: 25; background: rgba(0,0,0,.92); display: flex; flex-direction: column; align-items: center;
+    gap: 10px; padding: calc(20px + env(safe-area-inset-top)) 16px calc(20px + env(safe-area-inset-bottom));
+  }
+  .peek[hidden] { display: none; }
+  .peeklabel { font-size: 16px; font-weight: 700; }
   .listbtns { display: flex; gap: 6px; flex: none; }
   .listbtns button { white-space: nowrap; }
   .listhead { gap: 8px; }
@@ -272,9 +293,15 @@
       <button id="calNext" aria-label="次の月">›</button>
     </div>
     <div class="calstats" id="calStats"></div>
-    <div class="calgrid calweek"><span>日</span><span>月</span><span>火</span><span>水</span><span>木</span><span>金</span><span>土</span></div>
-    <div class="calgrid" id="calDays"></div>
-    <p class="note" style="text-align:left">動画がある日をタップすると編集、空いている日をタップすると、その日の動画を選べます。同じ日に何本かあるときは、一覧で上にある1本を使います。</p>
+    <div class="seg calviewseg" data-key="calView">
+      <button data-val="calendar">カレンダー</button><button data-val="album">アルバム</button>
+    </div>
+    <div id="calGridWrap">
+      <div class="calgrid calweek"><span>日</span><span>月</span><span>火</span><span>水</span><span>木</span><span>金</span><span>土</span></div>
+      <div class="calgrid" id="calDays"></div>
+    </div>
+    <div class="album" id="calAlbum" hidden></div>
+    <p class="note" style="text-align:left">動画がある日をタップすると編集、<b>長押しするとその場で再生</b>します。空いている日をタップすると、その日の動画を選べます。同じ日に何本かあるときは、一覧で上にある1本を使います。</p>
   </section>
 
   <div id="listArea">
@@ -529,6 +556,14 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
 
+<!-- 長押しでその場で再生 -->
+<div class="peek" id="peek" hidden>
+  <div class="peeklabel" id="peekLabel"></div>
+  <div class="stage"><canvas id="peekCanvas"></canvas></div>
+  <p class="note">タップで閉じる</p>
+</div>
+<video id="peekVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
+
 <video id="editVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
 <video id="renderVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
 
@@ -542,7 +577,7 @@ const $ = (s) => document.querySelector(s);
 const DEFAULTS = {
   seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std',
   videoVol: 100, bgmVol: 80, bgmStart: 0, bgmFade: 'on',
-  mode: 'list',
+  mode: 'list', calView: 'calendar',
   opening: 'on', openingCount: '6', openingTempo: 'normal', openingTitle: '', openingDate: 'on',
   look: 'none', grain: 'off', vignette: 'off', stamp: 'on', transition: 'cut',
   textStyle: { font: 'maru', color: '#ffffff', size: 0.07, style: 'shadow', x: 0.5, y: 0.78 },
@@ -1011,7 +1046,7 @@ async function makeThumb(c) {
   // 一度再生しないとフレームを描けないブラウザがある
   try { await v.play(); v.pause(); } catch (_) {}
   const cv = document.createElement('canvas');
-  cv.width = 120; cv.height = 160;
+  cv.width = 240; cv.height = 320; // アルバムで大きく見せてもきれいなように
   const g = cv.getContext('2d');
   // 使う区間の中ほどをサムネイルにする。真っ黒なら（デコーダーの準備待ちや、映像のない区間）少し待つ・別の位置を試す
   const last = Math.max(0, c.duration - 0.05);
@@ -1349,6 +1384,27 @@ function renderCalendar() {
       <span class="n">${d}</span>${list.length > 1 ? `<span class="cnt">${list.length}</span>` : ''}</button>`;
   }
   $('#calDays').innerHTML = cells;
+
+  // アルバム：その月の動画がある日だけを大きく並べる
+  const album = state.calView === 'album';
+  $('#calGridWrap').hidden = album;
+  $('#calAlbum').hidden = !album;
+  if (album) {
+    const tiles = [...map.entries()]
+      .filter(([iso]) => iso.startsWith(calMonth))
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([iso, list]) => {
+        const c = list[0];
+        const [, mm, dd] = iso.split('-').map(Number);
+        const memo = c.text?.value.trim().split('\n')[0] || '';
+        return `<button class="atile" data-date="${iso}"${c.thumb ? ` style="background-image:url(${c.thumb})"` : ''}>
+          ${list.length > 1 ? `<span class="cnt">${list.length}本</span>` : ''}
+          <span class="lbl">${mm}/${dd}（${WEEK[new Date(y, mm - 1, dd).getDay()]}）${memo ? `<small>${escapeHtml(memo)}</small>` : ''}</span>
+        </button>`;
+      });
+    $('#calAlbum').innerHTML = tiles.length ? tiles.join('') : `<p class="empty">${monthLabel(calMonth)}の動画はまだありません。</p>`;
+  }
+
   const streak = streakDays(map);
   $('#calStats').innerHTML = `${monthLabel(calMonth)}：<b>${filled}</b>日分　・　連続記録：<b>${streak}</b>日`;
   $('#todayNotice').hidden = map.has(today) || calMonth !== today.slice(0, 7);
@@ -1359,13 +1415,80 @@ function pickForDate(iso) {
   $('#fileInput').click();
 }
 
-$('#calDays').addEventListener('click', (e) => {
+// タップ：編集（動画がない日は動画を選ぶ）、長押し：その場で再生
+let pressTimer = 0, pressStart = null, suppressClick = false;
+$('#calendar').addEventListener('pointerdown', (e) => {
+  suppressClick = false;
   const b = e.target.closest('button[data-date]');
   if (!b) return;
+  const c = clipsByDate().get(b.dataset.date)?.[0];
+  if (!c || !c.duration || c.missing) return;
+  pressStart = { x: e.clientX, y: e.clientY };
+  clearTimeout(pressTimer);
+  pressTimer = setTimeout(() => {
+    suppressClick = true;
+    navigator.vibrate?.(15);
+    openPeek(c);
+  }, 450);
+});
+$('#calendar').addEventListener('pointermove', (e) => {
+  // 指が動いたら（スクロール）長押しにしない
+  if (pressStart && Math.hypot(e.clientX - pressStart.x, e.clientY - pressStart.y) > 10) clearTimeout(pressTimer);
+});
+['pointerup', 'pointercancel', 'pointerleave'].forEach((t) => $('#calendar').addEventListener(t, () => {
+  clearTimeout(pressTimer);
+  pressStart = null;
+}));
+$('#calendar').addEventListener('contextmenu', (e) => { if (e.target.closest('button[data-date]')) e.preventDefault(); });
+$('#calendar').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-date]');
+  if (!b) return;
+  if (suppressClick) { suppressClick = false; return; }
   const c = clipsByDate().get(b.dataset.date)?.[0];
   if (c && c.duration && !c.missing) openEditor(c);
   else if (!c) pickForDate(b.dataset.date);
 });
+
+// その場で再生：できあがりと同じ見た目（色味・画角・文字・日付）で、選んだ3秒をくり返す
+const pv = $('#peekVideo');
+const pcv = $('#peekCanvas');
+const pg = pcv.getContext('2d');
+let peekClip = null;
+function openPeek(c) {
+  peekClip = c;
+  const [W, H] = SIZES.std[state.aspect];
+  pcv.width = W / 2;
+  pcv.height = H / 2;
+  const [, mm, dd] = c.date.split('-').map(Number);
+  $('#peekLabel').textContent = `${mm}月${dd}日（${WEEK[new Date(+c.date.slice(0, 4), mm - 1, dd).getDay()]}）`;
+  $('#peek').hidden = false;
+  pv.muted = state.videoVol === 0;
+  pv.volume = state.videoVol / 100;
+  pv.dataset.src = c.url;
+  pv.src = c.url;
+  pv.currentTime = c.start;
+  pv.play().catch(() => { pv.muted = true; pv.play().catch(() => {}); });
+  requestAnimationFrame(peekLoop);
+}
+function peekLoop() {
+  const c = peekClip;
+  if (!c) return;
+  if (pv.currentTime >= c.start + segLen(c) - 0.01 || pv.ended) {
+    pv.currentTime = c.start;
+    pv.play().catch(() => {});
+  }
+  if (pv.readyState >= 2) {
+    renderFrame(pg, pv, pv.videoWidth, pv.videoHeight, pcv.width, pcv.height, { ...currentLook(), crop: c.crop });
+    pg.drawImage(overlayFor(c, pcv.width, pcv.height).canvas, 0, 0);
+  }
+  requestAnimationFrame(peekLoop);
+}
+function closePeek() {
+  peekClip = null;
+  releaseVideo(pv);
+  $('#peek').hidden = true;
+}
+$('#peek').addEventListener('click', closePeek);
 $('#calPrev').addEventListener('click', () => { calMonth = shiftMonth(calMonth, -1); renderList(); });
 $('#calNext').addEventListener('click', () => { calMonth = shiftMonth(calMonth, 1); renderList(); });
 $('#todayPick').addEventListener('click', () => pickForDate(fmtDate(new Date())));
