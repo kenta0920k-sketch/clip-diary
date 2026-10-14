@@ -370,6 +370,7 @@
   <div class="panel">
     <div class="tabs" id="editTabs">
       <button data-tab="range" class="on">範囲</button>
+      <button data-tab="crop">画角</button>
       <button data-tab="look">色味</button>
       <button data-tab="text">文字</button>
     </div>
@@ -391,6 +392,19 @@
         <button data-nudge="0.5">0.5秒 ▶▶</button>
       </div>
       <div class="daterow"><span>日付</span><input type="date" id="editDate"></div>
+    </div>
+
+    <div class="pane" data-pane="crop">
+      <p class="note" id="cropNote" style="text-align:left">画面を指でドラッグすると、映す位置を動かせます。拡大もできます。</p>
+      <label class="adj">
+        <span>拡大</span>
+        <input type="range" id="cropZoom" min="1" max="2.5" step="0.05">
+        <output id="cropZoomV"></output>
+      </label>
+      <div class="btnrow">
+        <button class="smallbtn" id="cropReset">中央に戻す</button>
+        <button class="smallbtn" id="cropAll">この画角を全部の動画に</button>
+      </div>
     </div>
 
     <div class="pane" data-pane="look">
@@ -749,17 +763,22 @@ function renderFrame(g, src, sw, sh, W, H, opt) {
     const rot = opt.rotate || 0;
     const swap = rot === 90 || rot === 270;
     const rw = swap ? sh : sw, rh = swap ? sw : sh; // 回転したあとの見た目の大きさ
-    const s = opt.fit === 'contain' ? Math.min(W / rw, H / rh) : Math.max(W / rw, H / rh);
+    // crop：画角（x・y＝はみ出した部分のどこを映すか 0〜1、z＝拡大）。「いっぱいに」のときだけ使う
+    const cover = opt.fit !== 'contain';
+    const crop = cover && opt.crop ? opt.crop : { x: 0.5, y: 0.5, z: 1 };
+    const s = (cover ? Math.max(W / rw, H / rh) : Math.min(W / rw, H / rh)) * (crop.z || 1);
     const dw = rw * s, dh = rh * s;
+    const cx = W / 2 + (W - dw) * ((crop.x ?? 0.5) - 0.5);
+    const cy = H / 2 + (H - dh) * ((crop.y ?? 0.5) - 0.5);
     g.filter = opt.look.css;
     if (rot) {
-      g.translate(W / 2, H / 2);
+      g.translate(cx, cy);
       g.rotate((rot * Math.PI) / 180);
       const w0 = swap ? dh : dw, h0 = swap ? dw : dh;
       g.drawImage(src, -w0 / 2, -h0 / 2, w0, h0);
       g.setTransform(1, 0, 0, 1, 0, 0);
     } else {
-      g.drawImage(src, (W - dw) / 2, (H - dh) / 2, dw, dh);
+      g.drawImage(src, cx - dw / 2, cy - dh / 2, dw, dh);
     }
     g.filter = 'none';
   }
@@ -1042,7 +1061,7 @@ async function idb(store, mode, fn) {
 }
 
 const SAVE_KEYS = ['id', 'name', 'size', 'type', 'lastModified', 'duration', 'start', 'date', 'thumb', 'thumbStart',
-  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored', 'dateSource', 'dateEdited'];
+  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored', 'dateSource', 'dateEdited', 'crop'];
 let restored = false;
 let saveTimer = 0;
 let persistAsked = false;
@@ -1440,6 +1459,7 @@ function setTab(tab) {
   document.querySelectorAll('.pane').forEach((p) => p.classList.toggle('on', p.dataset.pane === tab));
   if (tab === 'look') renderLooks();
   if (tab === 'text') syncTextUI();
+  if (tab === 'crop') syncCropUI();
 }
 $('#editTabs').addEventListener('click', (e) => {
   const b = e.target.closest('button[data-tab]');
@@ -1469,6 +1489,7 @@ function loadEditClip(c) {
   makeStrip(c);
   if (editTab === 'look') renderLooks();
   if (editTab === 'text') syncTextUI();
+  if (editTab === 'crop') syncCropUI();
 }
 
 async function makeStrip(c) {
@@ -1571,7 +1592,7 @@ function editLoop() {
       if (!userPaused) ev.play().catch(() => {});
     }
     if (ev.readyState >= 2) {
-      renderFrame(eg, ev, ev.videoWidth, ev.videoHeight, ecv.width, ecv.height, currentLook());
+      renderFrame(eg, ev, ev.videoWidth, ev.videoHeight, ecv.width, ecv.height, { ...currentLook(), crop: c.crop });
       const o = overlayFor(c, ecv.width, ecv.height);
       eg.drawImage(o.canvas, 0, 0);
       editBox = o.box;
@@ -1644,7 +1665,26 @@ function canvasPoint(e) {
   return { x: (e.clientX - r.left - ox) / s, y: (e.clientY - r.top - oy) / s };
 }
 let textDrag = null;
+let cropDrag = null;
+
+// 画角タブ：映像がはみ出している量（はみ出していない向きは0）
+function cropOverflow(c) {
+  const vw = ev.videoWidth, vh = ev.videoHeight;
+  if (!vw || !vh || state.fit !== 'cover') return { ox: 0, oy: 0 };
+  const W = ecv.width, H = ecv.height;
+  const s = Math.max(W / vw, H / vh) * (c.crop?.z || 1);
+  return { ox: vw * s - W, oy: vh * s - H };
+}
+
 $('#editStage').addEventListener('pointerdown', (e) => {
+  if (editTab === 'crop' && editing) {
+    // ドラッグで映す位置を動かす（ほとんど動かさずに離したら再生/一時停止）
+    const p = canvasPoint(e);
+    const cr = editing.crop || { x: 0.5, y: 0.5, z: 1 };
+    cropDrag = { p, start: { ...cr }, moved: false };
+    $('#editStage').setPointerCapture(e.pointerId);
+    return;
+  }
   if (editTab === 'text' && editing?.text?.value.trim()) {
     const p = canvasPoint(e);
     const t = editing.text;
@@ -1659,8 +1699,28 @@ $('#editStage').addEventListener('pointerdown', (e) => {
   }
   togglePlay();
 });
-$('#editStage').addEventListener('pointermove', (e) => { if (textDrag) moveText(canvasPoint(e)); });
+$('#editStage').addEventListener('pointermove', (e) => {
+  if (textDrag) moveText(canvasPoint(e));
+  if (cropDrag) {
+    const p = canvasPoint(e);
+    const dx = p.x - cropDrag.p.x, dy = p.y - cropDrag.p.y;
+    if (Math.abs(dx) + Math.abs(dy) > 4) cropDrag.moved = true;
+    const { ox, oy } = cropOverflow(editing);
+    const st = cropDrag.start;
+    // 指を右に動かすと映像も右へ（＝左側が見える）
+    editing.crop = {
+      ...st,
+      x: ox > 0 ? clamp(st.x - dx / ox, 0, 1) : 0.5,
+      y: oy > 0 ? clamp(st.y - dy / oy, 0, 1) : 0.5,
+    };
+  }
+});
 const endTextDrag = () => {
+  if (cropDrag) {
+    if (!cropDrag.moved) togglePlay();
+    cropDrag = null;
+    return;
+  }
   if (!textDrag) return;
   textDrag = null;
   state.textStyle = { ...state.textStyle, x: editing.text.x, y: editing.text.y };
@@ -1668,6 +1728,34 @@ const endTextDrag = () => {
 };
 $('#editStage').addEventListener('pointerup', endTextDrag);
 $('#editStage').addEventListener('pointercancel', endTextDrag);
+
+function syncCropUI() {
+  if (!editing) return;
+  const z = editing.crop?.z || 1;
+  $('#cropZoom').value = z;
+  $('#cropZoomV').textContent = `${z.toFixed(2)}倍`;
+  const usable = state.fit === 'cover';
+  $('#cropZoom').disabled = !usable;
+  $('#cropNote').textContent = usable
+    ? '画面を指でドラッグすると、映す位置を動かせます。拡大もできます。'
+    : '収め方が「全体を入れる」のときは、画角は動かせません。一覧画面の「収め方」を「いっぱいに」にすると使えます。';
+}
+$('#cropZoom').addEventListener('input', (e) => {
+  const z = +e.target.value;
+  editing.crop = { x: 0.5, y: 0.5, ...editing.crop, z };
+  $('#cropZoomV').textContent = `${z.toFixed(2)}倍`;
+});
+$('#cropReset').addEventListener('click', () => {
+  editing.crop = null;
+  syncCropUI();
+});
+$('#cropAll').addEventListener('click', () => {
+  const cr = editing.crop ? { ...editing.crop } : null;
+  state.clips.forEach((c) => { c.crop = cr ? { ...cr } : null; });
+  const btn = $('#cropAll');
+  btn.textContent = '✓ 全部に反映しました';
+  setTimeout(() => { btn.textContent = 'この画角を全部の動画に'; }, 1500);
+});
 
 function moveText(p) {
   const t = editing.text;
@@ -2069,7 +2157,7 @@ async function build(preview = false) {
   // 助走中（seg がまだない）も描かない：助走の映像が録画に1コマ混ざると、切り替えでチカッと光って見えるため
   const paint = () => {
     if (rv.readyState < 2 || !current || !seg) return;
-    renderFrame(g, rv, rv.videoWidth, rv.videoHeight, W, H, look);
+    renderFrame(g, rv, rv.videoWidth, rv.videoHeight, W, H, { ...look, crop: current.c.crop });
     g.drawImage(current.opening ? openingOverlay(W, H, clips) : overlayFor(current.c, W, H).canvas, 0, 0);
     // 切り替え効果
     const [a, color] = transitionAlpha(current, rv.currentTime - seg.start, seg.end - seg.start);
@@ -2761,7 +2849,7 @@ async function buildFast() {
       const dcfg = { codec: vt.codec, codedWidth: vt.video.width, codedHeight: vt.video.height, description: box ? boxPayload(box) : undefined };
       if (!(await VideoDecoder.isConfigSupported(dcfg)).supported) throw new Error(`decoder unsupported: ${vt.codec}`);
       const rot = trackRotation(vt, trak);
-      const opt = { ...look, rotate: rot };
+      const opt = { ...look, rotate: rot, crop: c.crop };
       const len = sg.len;
       const start = sg.start;
       const end = Math.min(c.duration, start + len);
