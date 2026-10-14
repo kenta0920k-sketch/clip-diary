@@ -2970,11 +2970,21 @@ async function openMp4(blob) {
   return { file, info };
 }
 
+// 動画の「本当の0秒」がファイルの中の時刻で何番目か。
+// スマホのカメラの動画は、圧縮の都合でコマの時刻が0ではなく少し後（0.1秒くらい）から始まることがある。
+// 再生アプリはこのずれを消して0秒から表示するので、こちらも同じように差し引く
+function startTicks(samples) {
+  let m = Infinity;
+  for (let i = 0; i < Math.min(samples.length, 60); i++) m = Math.min(m, samples[i].cts);
+  return isFinite(m) ? m : 0;
+}
+
 // t0〜t1秒に必要なコマだけをファイルから読み出す（映像はその前のキーフレームから）
 async function readSamples(blob, samples, t0, t1, video) {
   if (!samples?.length) return [];
   const ts = samples[0].timescale;
-  const a = t0 * ts, b = t1 * ts;
+  const off = startTicks(samples);
+  const a = t0 * ts + off, b = t1 * ts + off;
   let first = -1;
   if (video) {
     for (let i = 0; i < samples.length; i++) {
@@ -2995,7 +3005,8 @@ async function readSamples(blob, samples, t0, t1, video) {
   let lo = Infinity, hi = 0;
   for (const s of list) { lo = Math.min(lo, s.offset); hi = Math.max(hi, s.offset + s.size); }
   const buf = new Uint8Array(await blob.slice(lo, hi).arrayBuffer());
-  return list.map((s) => ({ s, data: buf.subarray(s.offset - lo, s.offset - lo + s.size) }));
+  // us：本当の0秒からの時刻（マイクロ秒）
+  return list.map((s) => ({ s, us: Math.round(((s.cts - off) * 1e6) / ts), data: buf.subarray(s.offset - lo, s.offset - lo + s.size) }));
 }
 
 function trackRotation(track, trak) {
@@ -3060,9 +3071,9 @@ async function decodeClipAudio(blob, media, start, len) {
     error: (e) => { err = e; },
   });
   dec.configure(cfg);
-  for (const { s, data } of items) {
+  for (const { s, us, data } of items) {
     dec.decode(new EncodedAudioChunk({
-      type: 'key', timestamp: Math.round((s.cts * 1e6) / s.timescale), duration: Math.round((s.duration * 1e6) / s.timescale), data,
+      type: 'key', timestamp: us, duration: Math.round((s.duration * 1e6) / s.timescale), data,
     }));
   }
   await dec.flush();
@@ -3279,10 +3290,10 @@ async function buildFast(bitrateOverride) {
           if (queue.length) { await handle(queue.shift()); continue; }
           if (k < items.length) {
             if (dec.decodeQueueSize < 6) {
-              const { s, data } = items[k++];
+              const { s, us, data } = items[k++];
               dec.decode(new EncodedVideoChunk({
                 type: (s.is_sync ?? s.is_rap) ? 'key' : 'delta',
-                timestamp: Math.round((s.cts * 1e6) / s.timescale),
+                timestamp: us,
                 duration: Math.round((s.duration * 1e6) / s.timescale),
                 data,
               }));
