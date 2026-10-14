@@ -374,7 +374,7 @@
     <div class="row">
       <label>画質</label>
       <div class="seg" data-key="quality">
-        <button data-val="std">標準 720p</button><button data-val="high">高画質 1080p</button>
+        <button data-val="std">標準 720p</button><button data-val="high">高画質 1080p</button><button data-val="source">元動画と同じ</button>
       </div>
     </div>
     <div class="row">
@@ -606,19 +606,43 @@ const SIZES = {
   std: { '9:16': [720, 1280], '16:9': [1280, 720], '1:1': [720, 720] },
   high: { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080] },
 };
-const BITRATE = { std: 6_000_000, high: 12_000_000 };
+const BITRATE = { std: 8_000_000, high: 20_000_000, '4k': 45_000_000 };
+SIZES['4k'] = { '9:16': [2160, 3840], '16:9': [3840, 2160], '1:1': [2160, 2160] };
+const qualityKey = () => (state.quality === 'source' ? 'high' : state.quality); // 「元動画と同じ」は書き出すときに決める
+
+// 「元動画と同じ」：選んだ動画の大きさ（短い辺）と細かさ（ファイルの大きさ÷長さ）を調べて合わせる
+async function sourceProfile(clips, mediaCache) {
+  let short = 0;
+  const rates = [];
+  for (const c of clips.slice(0, 5)) {
+    try {
+      if (!mediaCache.has(c)) mediaCache.set(c, await openMp4(c.file));
+      const vt = mediaCache.get(c).info.videoTracks[0];
+      short = Math.max(short, Math.min(vt.video.width, vt.video.height));
+    } catch (_) {}
+  }
+  for (const c of clips) if (c.size && c.duration) rates.push((c.size * 8) / c.duration);
+  rates.sort((a, b) => a - b);
+  const median = rates.length ? rates[Math.floor(rates.length / 2)] : BITRATE.high;
+  const key = short >= 1800 ? '4k' : short >= 900 ? 'high' : 'std';
+  return { key, bitrate: clamp(Math.round(median * 0.95), BITRATE.std, 80_000_000) };
+}
 // 「50MB以内」のとき：完成動画の長さから、50MBに収まる記録の細かさ（ビットレート）を計算する。
 // 音（128kbps）とファイルの入れ物の分、少し余裕を持たせて 46MB を目標にする
 const FIT_BYTES = 46 * 1024 * 1024;
 const MIN_BITRATE = 1_500_000;
-function targetBitrate(totalSec) {
-  const max = BITRATE[state.quality];
+function targetBitrate(totalSec, maxOverride) {
+  const max = maxOverride || BITRATE[qualityKey()];
   if (state.shareSize !== 'fit' || !totalSec) return max;
   return clamp(Math.floor((FIT_BYTES * 8) / totalSec - 128_000), MIN_BITRATE, max);
 }
 function updateSizeNote(totalSec) {
   const note = $('#sizeNote');
   if (!note) return;
+  if (state.quality === 'source') {
+    note.textContent = '元動画と同じ大きさ（4Kなら4K）・同じくらいの細かさで書き出します。ファイルが大きくなるので、ダウンロードしてから共有してください。書き出しにも時間がかかります。';
+    return;
+  }
   const max = BITRATE[state.quality];
   if (state.shareSize !== 'fit') {
     note.textContent = `いつもの細かさ（${max / 1e6}Mbps）で作ります。長い動画は50MBを超えることがあり、そのときはダウンロードしてから共有します。`;
@@ -885,6 +909,9 @@ function renderFrame(g, src, sw, sh, W, H, opt) {
     const cx = W / 2 + (W - dw) * ((crop.x ?? 0.5) - 0.5);
     const cy = H / 2 + (H - dh) * ((crop.y ?? 0.5) - 0.5);
     g.filter = opt.look.css;
+    // 4Kの元動画を縮めるときに細かいところがぼやけないように、きれいな縮小方法を使う
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = 'high';
     if (rot) {
       g.translate(cx, cy);
       g.rotate((rot * Math.PI) / 180);
@@ -1760,6 +1787,9 @@ document.addEventListener('click', (e) => {
   const key = b.closest('.seg').dataset.key;
   state[key] = key === 'seconds' ? +b.dataset.val : b.dataset.val;
   if (key === 'seconds') state.clips.forEach((c) => { c.start = Math.min(c.start, maxStart(c)); });
+  // 「元動画と同じ」は大きなファイルになるので、ファイルの大きさは「画質優先」にする
+  if (key === 'quality' && state.quality === 'source') state.shareSize = 'max';
+  if (key === 'shareSize' && state.shareSize === 'fit' && state.quality === 'source') state.quality = 'high';
   if (key === 'aspect') {
     // 形を変えたら、向きの合う動画に入れ替える（「これも使う」はリセット）
     [...state.clips, ...state.hidden].forEach((c) => { c.keep = false; });
@@ -2379,6 +2409,12 @@ async function build(preview = false) {
   // まず速い方法（WebCodecs）で書き出す。使えない・失敗したときは、再生しながら録画する方法に切り替える
   if (!preview && canFastExport()) {
     let r = await buildFast();
+    // H.265 でうまくいかなかったときは、H.264 でもう一度
+    if (r === 'failed' && lastCodec === 'hevc') {
+      forceAvc = true;
+      r = await buildFast();
+      forceAvc = false;
+    }
     // 「50MB以内」なのに超えてしまったら、超えた分だけ細かさを下げて、1回だけ作り直す
     if (r === 'done' && state.shareSize === 'fit' && result.blob.size > SHARE_LIMIT && lastBitrate > MIN_BITRATE) {
       const next = Math.max(MIN_BITRATE, Math.floor(lastBitrate * ((SHARE_LIMIT * 0.9) / result.blob.size)));
@@ -2437,7 +2473,7 @@ async function build(preview = false) {
   }
 
   // プレビューは軽くするため標準画質で描く
-  const [W, H] = SIZES[preview ? 'std' : state.quality][state.aspect];
+  const [W, H] = SIZES[preview ? 'std' : qualityKey()][state.aspect];
   const cv = $('#renderCanvas');
   cv.width = W; cv.height = H;
   const g = cv.getContext('2d');
@@ -2973,17 +3009,23 @@ async function openMp4(blob) {
 // 動画の「本当の0秒」がファイルの中の時刻で何番目か。
 // スマホのカメラの動画は、圧縮の都合でコマの時刻が0ではなく少し後（0.1秒くらい）から始まることがある。
 // 再生アプリはこのずれを消して0秒から表示するので、こちらも同じように差し引く
-function startTicks(samples) {
+function startTicks(samples, trak) {
+  // 再生範囲の指定（編集リスト elst）があれば、それに従う
+  const entries = trak?.edts?.elst?.entries;
+  if (entries?.length) {
+    const e = entries.find((x) => x.media_time >= 0);
+    if (e) return e.media_time;
+  }
   let m = Infinity;
   for (let i = 0; i < Math.min(samples.length, 60); i++) m = Math.min(m, samples[i].cts);
   return isFinite(m) ? m : 0;
 }
 
 // t0〜t1秒に必要なコマだけをファイルから読み出す（映像はその前のキーフレームから）
-async function readSamples(blob, samples, t0, t1, video) {
+async function readSamples(blob, samples, t0, t1, video, trak) {
   if (!samples?.length) return [];
   const ts = samples[0].timescale;
-  const off = startTicks(samples);
+  const off = startTicks(samples, trak);
   const a = t0 * ts + off, b = t1 * ts + off;
   let first = -1;
   if (video) {
@@ -3016,15 +3058,23 @@ function trackRotation(track, trak) {
   return ((deg % 360) + 360) % 360;
 }
 
+// 圧縮方式を選ぶ。H.265（HEVC）は同じ大きさでも H.264 よりずっときれいなので、スマホが対応していれば優先する。
+// 戻り値：{ cfg: VideoEncoder の設定, mux: mp4-muxer に渡す方式名 }
+let forceAvc = false; // H.265 で失敗したときは H.264 でやり直す
 async function pickVideoEncoderConfig(W, H, bitrate) {
-  const codecs = ['avc1.640028', 'avc1.4d0028', 'avc1.42e028', 'avc1.640032', 'avc1.42001f'];
+  const big = Math.max(W, H) > 2000;
+  const candidates = [
+    ...(forceAvc ? [] : ['hvc1.1.6.L153.B0', 'hvc1.1.6.L150.B0', 'hvc1.1.6.L123.B0'].map((codec) => ({ codec, mux: 'hevc', extra: { hevc: { format: 'hevc' } } }))),
+    ...(big ? ['avc1.640033', 'avc1.4d0033'] : ['avc1.640028', 'avc1.4d0028', 'avc1.42e028', 'avc1.640032', 'avc1.42001f'])
+      .map((codec) => ({ codec, mux: 'avc', extra: { avc: { format: 'avc' } } })),
+  ];
   for (const hw of ['prefer-hardware', 'no-preference']) {
-    for (const codec of codecs) {
+    for (const cand of candidates) {
       // 大きさを見込みどおりにするため、できれば一定の細かさ（constant）で圧縮する
       for (const bitrateMode of ['constant', 'variable']) {
-        const cfg = { codec, width: W, height: H, bitrate, bitrateMode, framerate: FAST_FPS, hardwareAcceleration: hw, avc: { format: 'avc' } };
+        const cfg = { codec: cand.codec, width: W, height: H, bitrate, bitrateMode, framerate: FAST_FPS, hardwareAcceleration: hw, ...cand.extra };
         try {
-          if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg;
+          if ((await VideoEncoder.isConfigSupported(cfg)).supported) return { cfg, mux: cand.mux };
         } catch (_) {}
       }
     }
@@ -3053,7 +3103,7 @@ async function decodeClipAudio(blob, media, start, len) {
     description: entry.esds?.esd?.descs?.[0]?.descs?.[0]?.data,
   };
   if (!(await AudioDecoder.isConfigSupported(cfg)).supported) return null;
-  const items = await readSamples(blob, trak.samples, start - 0.1, start + len + 0.1, false);
+  const items = await readSamples(blob, trak.samples, start - 0.1, start + len + 0.1, false, trak);
   const sr = cfg.sampleRate, nch = cfg.numberOfChannels, n = Math.max(1, Math.ceil(len * sr));
   const pcm = Array.from({ length: nch }, () => new Float32Array(n));
   let err = null;
@@ -3147,6 +3197,7 @@ async function encodeAudioMix({ clipAudio, total, videoVol, acfg, muxer }) {
 // 戻り値：'done'（完成）／'cancelled'（キャンセル）／'failed'（この方法では書き出せなかった）
 // bitrateOverride：50MBを超えたときの作り直しで、細かさを指定する
 let lastBitrate = 0;
+let lastCodec = '';
 async function buildFast(bitrateOverride) {
   const clips = buildClips();
   const t0 = performance.now();
@@ -3168,7 +3219,16 @@ async function buildFast(bitrateOverride) {
   let venc = null;
   try {
     await Promise.all(clips.map((c) => ensureFont(c.text)));
-    const [W, H] = SIZES[state.quality][state.aspect];
+    const mediaCache = new Map(); // 同じ動画を何度も使うときは、目次を読み直さない
+    // 「元動画と同じ」なら、元の動画の大きさと細かさに合わせる
+    let sizeKey = qualityKey(), maxBitrate = BITRATE[sizeKey];
+    if (state.quality === 'source') {
+      $('#renderText').textContent = '元の動画を調べています…';
+      const p = await sourceProfile(clips, mediaCache);
+      sizeKey = p.key;
+      maxBitrate = p.bitrate;
+    }
+    const [W, H] = SIZES[sizeKey][state.aspect];
     const cv = $('#renderCanvas');
     cv.width = W; cv.height = H;
     const g = cv.getContext('2d');
@@ -3176,7 +3236,7 @@ async function buildFast(bitrateOverride) {
     g.fillRect(0, 0, W, H);
 
     const plannedSec = makeSegments(clips).reduce((s, sg) => s + sg.len, 0);
-    lastBitrate = bitrateOverride || targetBitrate(plannedSec);
+    lastBitrate = bitrateOverride || targetBitrate(plannedSec, maxBitrate);
     // 縦長の動画は、横長に倒して圧縮し、「90度回して表示」の印を付ける（スマホのカメラと同じやり方）。
     // スマホの圧縮部品は横長が得意で、縦長のままだと細かさの指定が効かず大きくなることがあるため
     const portrait = H > W;
@@ -3189,6 +3249,7 @@ async function buildFast(bitrateOverride) {
     }
     const vcfg = await pickVideoEncoderConfig(encW, encH, lastBitrate);
     if (!vcfg) throw new Error('no video encoder');
+    lastCodec = vcfg.mux;
     const videoVol = state.videoVol / 100;
     const withAudio = videoVol > 0 || !!state.bgm;
     const acfg = withAudio ? await pickAudioEncoderConfig() : null;
@@ -3199,7 +3260,7 @@ async function buildFast(bitrateOverride) {
       target,
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset',
-      video: { codec: 'avc', width: encW, height: encH, frameRate: FAST_FPS, rotation: portrait ? 90 : 0 },
+      video: { codec: vcfg.mux, width: encW, height: encH, frameRate: FAST_FPS, rotation: portrait ? 90 : 0 },
       audio: acfg ? { codec: acfg.mux, sampleRate: 48000, numberOfChannels: 2 } : undefined,
     });
     // 「部品の手が空いた・コマができた」の合図を待つ（決まった時間待つより速い）
@@ -3210,7 +3271,7 @@ async function buildFast(bitrateOverride) {
     let encErr = null;
     venc = new VideoEncoder({ output: (chunk, meta) => { muxer.addVideoChunk(chunk, meta); notify(); }, error: (e) => { encErr = e; notify(); } });
     venc.addEventListener?.('dequeue', notify);
-    venc.configure(vcfg);
+    venc.configure(vcfg.cfg);
 
     const look = currentLook();
     const step = 1 / FAST_FPS;
@@ -3220,7 +3281,6 @@ async function buildFast(bitrateOverride) {
     // オープニングの短いカット＋本編を、1つの並びとして順に処理する
     const segs = makeSegments(clips);
     if (state.opening === 'on') await ensureFont({ value: state.openingTitle || '2026', font: state.textStyle.font });
-    const mediaCache = new Map(); // 同じ動画を何度も使うときは、目次を読み直さない
 
     for (let i = 0; i < segs.length && !cancelled; i++) {
       const sg = segs[i];
@@ -3240,7 +3300,7 @@ async function buildFast(bitrateOverride) {
       const len = sg.len;
       const start = sg.start;
       const end = Math.min(c.duration, start + len);
-      const items = await readSamples(c.file, trak.samples, start, end, true);
+      const items = await readSamples(c.file, trak.samples, start, end, true, trak);
 
       // 1コマ描いて圧縮に回す
       const emit = async (frame, rel) => {
@@ -3346,7 +3406,7 @@ async function buildFast(bitrateOverride) {
     showResult(blob, 'video/mp4', 'mp4', clips.length, (performance.now() - t0) / 1000);
     // 実際の細かさ（確認用）
     const realMbps = (blob.size * 8) / Math.max(1, outT) / 1e6;
-    $('#resultInfo').textContent += ` ・ ${realMbps.toFixed(1)}Mbps`;
+    $('#resultInfo').textContent += ` ・ ${W > H ? `${W}×${H}` : `${H}×${W}縦`} ${lastCodec === 'hevc' ? 'H.265' : 'H.264'} ${realMbps.toFixed(1)}Mbps`;
     return 'done';
   } catch (e) {
     console.warn('fast export failed', e);
