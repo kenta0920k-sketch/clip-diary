@@ -1,6 +1,6 @@
 // オフラインでも開けるようにするための Service Worker
 // アプリを更新したら VERSION を上げる
-const VERSION = 'v16';
+const VERSION = 'v17';
 const CACHE = `clip-diary-${VERSION}`;
 const FONT_CACHE = 'clip-diary-fonts';
 const SHELL = [

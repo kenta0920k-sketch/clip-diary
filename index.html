@@ -147,6 +147,28 @@
     color: var(--text); font: inherit; font-size: 16px;
   }
   #bgmInput { display: none; }
+  .modeseg { justify-content: stretch; margin-bottom: 14px; }
+  .modeseg button { flex: 1; padding: 9px; font-size: 14px; }
+  .calendar { margin-top: 14px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
+  .calhead { display: flex; align-items: center; justify-content: space-between; }
+  .calhead b { font-size: 17px; }
+  .calhead button { width: 40px; height: 40px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); font-size: 20px; }
+  .calstats { font-size: 13px; color: var(--sub); text-align: center; }
+  .calstats b { color: var(--accent); font-size: 15px; }
+  .calgrid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+  .calweek span { text-align: center; font-size: 11px; color: var(--sub); }
+  .calweek span:first-child { color: #ff7a7a; }
+  .calweek span:last-child { color: #7ab0ff; }
+  .day {
+    position: relative; aspect-ratio: 3 / 4; border: 0; border-radius: 8px; padding: 0; overflow: hidden;
+    background: #1c1c1c center / cover no-repeat; font-size: 11px; color: var(--sub);
+  }
+  .day .n { position: absolute; left: 4px; top: 3px; text-shadow: 0 1px 3px #000; }
+  .day.has .n { color: #fff; font-weight: 700; }
+  .day .cnt { position: absolute; right: 3px; bottom: 3px; background: rgba(0,0,0,.7); color: #fff; border-radius: 6px; padding: 0 4px; font-size: 10px; }
+  .day.today { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .day.future { opacity: .35; }
+  .day.empty { visibility: hidden; }
   .listbtns { display: flex; gap: 6px; flex: none; }
   .listbtns button { white-space: nowrap; }
   .listhead { gap: 8px; }
@@ -211,6 +233,10 @@
 </header>
 
 <main>
+  <div class="seg modeseg" data-key="mode">
+    <button data-val="list">まとめて作る</button><button data-val="daily">毎日1本</button>
+  </div>
+
   <div class="shape">
     <span>つくる動画の形</span>
     <div class="seg" data-key="aspect">
@@ -234,14 +260,33 @@
     <button id="hiddenUse">これも使う</button>
   </div>
 
-  <div class="listhead">
-    <span id="listInfo">クリップ</span>
-    <span class="listbtns">
-      <button id="resetBtn">最初から</button>
-      <button id="sortBtn">日付順</button>
-    </span>
+  <!-- 毎日1本：カレンダー -->
+  <section class="calendar" id="calendar" hidden>
+    <div class="notice" id="todayNotice" hidden>
+      <span>今日の1本がまだです。</span>
+      <button id="todayPick">今日の動画を選ぶ</button>
+    </div>
+    <div class="calhead">
+      <button id="calPrev" aria-label="前の月">‹</button>
+      <b id="calTitle"></b>
+      <button id="calNext" aria-label="次の月">›</button>
+    </div>
+    <div class="calstats" id="calStats"></div>
+    <div class="calgrid calweek"><span>日</span><span>月</span><span>火</span><span>水</span><span>木</span><span>金</span><span>土</span></div>
+    <div class="calgrid" id="calDays"></div>
+    <p class="note" style="text-align:left">動画がある日をタップすると編集、空いている日をタップすると、その日の動画を選べます。同じ日に何本かあるときは、一覧で上にある1本を使います。</p>
+  </section>
+
+  <div id="listArea">
+    <div class="listhead">
+      <span id="listInfo">クリップ</span>
+      <span class="listbtns">
+        <button id="resetBtn">最初から</button>
+        <button id="sortBtn">日付順</button>
+      </span>
+    </div>
+    <ol class="clips" id="clipList"></ol>
   </div>
-  <ol class="clips" id="clipList"></ol>
 
   <h2>オープニング</h2>
   <section class="settings">
@@ -497,6 +542,7 @@ const $ = (s) => document.querySelector(s);
 const DEFAULTS = {
   seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std',
   videoVol: 100, bgmVol: 80, bgmStart: 0, bgmFade: 'on',
+  mode: 'list',
   opening: 'on', openingCount: '6', openingTempo: 'normal', openingTitle: '', openingDate: 'on',
   look: 'none', grain: 'off', vignette: 'off', stamp: 'on', transition: 'cut',
   textStyle: { font: 'maru', color: '#ffffff', size: 0.07, style: 'shadow', x: 0.5, y: 0.78 },
@@ -1195,6 +1241,9 @@ async function clearProject() {
 
 function addFiles(files) {
   const list = [...files].filter((f) => f.type.startsWith('video/') || /\.(mov|mp4|m4v|webm|3gp)$/i.test(f.name));
+  // カレンダーの空いている日から選んだときは、その日の動画にする
+  const forcedDate = pendingDate;
+  pendingDate = null;
   const job = async () => {
     for (let i = 0; i < list.length; i++) {
       const file = list[i];
@@ -1206,9 +1255,10 @@ function addFiles(files) {
         duration: 0, start: 0, date: guessDate(file), thumb: '', strip: null, confirmed: false, error: '', text: null,
         orient: null, keep: false, stored: false, missing: false,
       };
-      const d = await detectDate(file, file.name, file.lastModified);
+      const d = forcedDate ? { date: forcedDate, source: 'calendar' } : await detectDate(file, file.name, file.lastModified);
       c.date = d.date;
       c.dateSource = d.source;
+      if (forcedDate) c.dateEdited = true;
       storeVideo(c);
       try {
         await loadSrc(probeVideo, c.url);
@@ -1233,6 +1283,93 @@ function addFiles(files) {
   probing = probing.then(job, job);
 }
 
+// ---------- 毎日1本（カレンダー） ----------
+let calMonth = fmtDate(new Date()).slice(0, 7); // 表示している月（例：2026-10）
+let pendingDate = null; // 空いている日をタップして選んだときの日付
+
+const isDaily = () => state.mode === 'daily';
+const monthLabel = (ym) => `${+ym.slice(0, 4)}年${+ym.slice(5, 7)}月`;
+function shiftMonth(ym, d) {
+  const [y, m] = ym.split('-').map(Number);
+  const t = new Date(y, m - 1 + d, 1);
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}`;
+}
+
+// 日付ごとの動画（一覧で上にあるものが先）
+function clipsByDate() {
+  const map = new Map();
+  for (const c of state.clips) {
+    if (c.error) continue;
+    if (!map.has(c.date)) map.set(c.date, []);
+    map.get(c.date).push(c);
+  }
+  return map;
+}
+
+// 書き出しに使う動画：「毎日1本」なら表示中の月の、1日1本を日付順に
+function buildClips() {
+  const ready = readyClips();
+  if (!isDaily()) return ready;
+  const seen = new Set();
+  return ready
+    .filter((c) => c.date.startsWith(calMonth))
+    .filter((c) => (seen.has(c.date) ? false : seen.add(c.date)))
+    .sort((a, b) => a.date.localeCompare(b.date));
+}
+
+// 今日（今日がまだなら昨日）から何日続けて撮れているか
+function streakDays(map) {
+  const d = new Date();
+  if (!map.has(fmtDate(d))) d.setDate(d.getDate() - 1);
+  let n = 0;
+  while (map.has(fmtDate(d))) { n++; d.setDate(d.getDate() - 1); }
+  return n;
+}
+
+function renderCalendar() {
+  const map = clipsByDate();
+  const today = fmtDate(new Date());
+  const [y, m] = calMonth.split('-').map(Number);
+  const first = new Date(y, m - 1, 1).getDay();
+  const days = new Date(y, m, 0).getDate();
+  $('#calTitle').textContent = monthLabel(calMonth);
+  $('#calNext').disabled = calMonth >= today.slice(0, 7);
+  $('#calNext').style.opacity = $('#calNext').disabled ? 0.3 : 1;
+
+  let cells = '<span class="day empty"></span>'.repeat(first);
+  let filled = 0;
+  for (let d = 1; d <= days; d++) {
+    const iso = `${calMonth}-${pad(d)}`;
+    const list = map.get(iso) || [];
+    const c = list[0];
+    if (c) filled++;
+    const cls = ['day', c ? 'has' : '', iso === today ? 'today' : '', iso > today ? 'future' : ''].join(' ');
+    const bg = c?.thumb ? ` style="background-image:url(${c.thumb})"` : '';
+    cells += `<button class="${cls}" data-date="${iso}"${bg} ${iso > today ? 'disabled' : ''} aria-label="${m}月${d}日${c ? '（動画あり）' : ''}">
+      <span class="n">${d}</span>${list.length > 1 ? `<span class="cnt">${list.length}</span>` : ''}</button>`;
+  }
+  $('#calDays').innerHTML = cells;
+  const streak = streakDays(map);
+  $('#calStats').innerHTML = `${monthLabel(calMonth)}：<b>${filled}</b>日分　・　連続記録：<b>${streak}</b>日`;
+  $('#todayNotice').hidden = map.has(today) || calMonth !== today.slice(0, 7);
+}
+
+function pickForDate(iso) {
+  pendingDate = iso;
+  $('#fileInput').click();
+}
+
+$('#calDays').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-date]');
+  if (!b) return;
+  const c = clipsByDate().get(b.dataset.date)?.[0];
+  if (c && c.duration && !c.missing) openEditor(c);
+  else if (!c) pickForDate(b.dataset.date);
+});
+$('#calPrev').addEventListener('click', () => { calMonth = shiftMonth(calMonth, -1); renderList(); });
+$('#calNext').addEventListener('click', () => { calMonth = shiftMonth(calMonth, 1); renderList(); });
+$('#todayPick').addEventListener('click', () => pickForDate(fmtDate(new Date())));
+
 // ---------- 一覧 ----------
 let drag = null;
 let renderPending = false;
@@ -1252,6 +1389,22 @@ function renderList() {
 
   const main = $('#mainBtn');
   main.disabled = ready.length === 0;
+  $('#calendar').hidden = !isDaily();
+  $('#listArea').hidden = isDaily();
+  if (isDaily()) {
+    // 毎日1本：表示中の月の動画（1日1本）をつなげる
+    renderCalendar();
+    const month = buildClips();
+    const mt = month.reduce((s, c) => s + segLen(c), 0) + openingLength(month);
+    main.dataset.mode = 'build';
+    main.disabled = month.length === 0;
+    main.textContent = month.length
+      ? `${+calMonth.slice(5, 7)}月の動画をつくる（${month.length}日分・約${Math.round(mt)}秒）`
+      : `${+calMonth.slice(5, 7)}月の動画はまだありません`;
+    $('#buildAnywayBtn').style.display = 'none';
+    $('#previewBtn').style.display = month.length ? '' : 'none';
+    return;
+  }
   if (todo.length) {
     main.dataset.mode = 'edit';
     main.textContent = `使う部分を選ぶ（あと${todo.length}本）`;
@@ -1385,7 +1538,10 @@ $('#sortBtn').addEventListener('click', () => {
   renderList();
 });
 
-$('#pickBtn').addEventListener('click', () => $('#fileInput').click());
+$('#pickBtn').addEventListener('click', () => {
+  pendingDate = null; // カレンダーの日付は使わず、動画の撮影日で入れる
+  $('#fileInput').click();
+});
 $('#fileInput').addEventListener('change', (e) => { addFiles(e.target.files); e.target.value = ''; });
 
 $('#mainBtn').addEventListener('click', () => {
@@ -2024,7 +2180,7 @@ function setProgress(i, n, frac) {
 
 // preview = true のときは録画せず、画面と音だけ再生する（書き出す前の確認用）
 async function build(preview = false) {
-  const clips = readyClips();
+  const clips = buildClips();
   if (!clips.length) return;
   // まず速い方法（WebCodecs）で書き出す。使えない・失敗したときは、再生しながら録画する方法に切り替える
   if (!preview && canFastExport()) {
@@ -2773,7 +2929,7 @@ async function encodeAudioMix({ clipAudio, total, videoVol, acfg, muxer }) {
 
 // 戻り値：'done'（完成）／'cancelled'（キャンセル）／'failed'（この方法では書き出せなかった）
 async function buildFast() {
-  const clips = readyClips();
+  const clips = buildClips();
   const t0 = performance.now();
   cancelled = false;
   result = null;
