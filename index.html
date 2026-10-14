@@ -377,6 +377,13 @@
         <button data-val="std">標準 720p</button><button data-val="high">高画質 1080p</button>
       </div>
     </div>
+    <div class="row">
+      <label>ファイルの大きさ</label>
+      <div class="seg" data-key="shareSize">
+        <button data-val="fit">50MB以内</button><button data-val="max">画質優先</button>
+      </div>
+    </div>
+    <p class="note" id="sizeNote" style="text-align:left;margin-top:-4px"></p>
   </section>
 
   <h2>音</h2>
@@ -575,7 +582,7 @@ const $ = (s) => document.querySelector(s);
 
 // ---------- 設定 ----------
 const DEFAULTS = {
-  seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std',
+  seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std', shareSize: 'fit',
   videoVol: 100, bgmVol: 80, bgmStart: 0, bgmFade: 'on',
   mode: 'list', calView: 'calendar',
   opening: 'on', openingCount: '6', openingTempo: 'normal', openingTitle: '', openingDate: 'on',
@@ -600,6 +607,32 @@ const SIZES = {
   high: { '9:16': [1080, 1920], '16:9': [1920, 1080], '1:1': [1080, 1080] },
 };
 const BITRATE = { std: 6_000_000, high: 12_000_000 };
+// 「50MB以内」のとき：完成動画の長さから、50MBに収まる記録の細かさ（ビットレート）を計算する。
+// 音（128kbps）とファイルの入れ物の分、少し余裕を持たせて 46MB を目標にする
+const FIT_BYTES = 46 * 1024 * 1024;
+const MIN_BITRATE = 1_500_000;
+function targetBitrate(totalSec) {
+  const max = BITRATE[state.quality];
+  if (state.shareSize !== 'fit' || !totalSec) return max;
+  return clamp(Math.floor((FIT_BYTES * 8) / totalSec - 128_000), MIN_BITRATE, max);
+}
+function updateSizeNote(totalSec) {
+  const note = $('#sizeNote');
+  if (!note) return;
+  const max = BITRATE[state.quality];
+  if (state.shareSize !== 'fit') {
+    note.textContent = `いつもの細かさ（${max / 1e6}Mbps）で作ります。長い動画は50MBを超えることがあり、そのときはダウンロードしてから共有します。`;
+    return;
+  }
+  if (!totalSec) { note.textContent = '共有画面からそのまま送れるように、50MB以内に収めます。'; return; }
+  const b = targetBitrate(totalSec);
+  const est = ((b + 128_000) * totalSec) / 8 / 1024 / 1024;
+  note.textContent = b >= max
+    ? `約${Math.round(totalSec)}秒なら、画質を下げずに50MB以内（約${Math.round(est)}MB）に収まります。`
+    : b > MIN_BITRATE
+      ? `約${Math.round(totalSec)}秒なので、細かさを${(b / 1e6).toFixed(1)}Mbps（いつもは${max / 1e6}Mbps）にして、約${Math.round(est)}MBに収めます。`
+      : `約${Math.round(totalSec)}秒と長いため、細かさを下げても50MBを超えるかもしれません。`;
+}
 // Android の Chrome は、共有画面に渡せるファイルを 50MB までに制限している
 const SHARE_LIMIT = 50 * 1024 * 1024;
 // 各クリップの少し手前から再生を始め、映像が滑らかに流れ出してから録画する（冒頭のカクつき対策）
@@ -1562,8 +1595,10 @@ function renderList() {
       : `${+calMonth.slice(5, 7)}月の動画はまだありません`;
     $('#buildAnywayBtn').style.display = 'none';
     $('#previewBtn').style.display = month.length ? '' : 'none';
+    updateSizeNote(mt);
     return;
   }
+  updateSizeNote(total);
   if (todo.length) {
     main.dataset.mode = 'edit';
     main.textContent = `使う部分を選ぶ（あと${todo.length}本）`;
@@ -2343,7 +2378,13 @@ async function build(preview = false) {
   if (!clips.length) return;
   // まず速い方法（WebCodecs）で書き出す。使えない・失敗したときは、再生しながら録画する方法に切り替える
   if (!preview && canFastExport()) {
-    const r = await buildFast();
+    let r = await buildFast();
+    // 「50MB以内」なのに超えてしまったら、超えた分だけ細かさを下げて、1回だけ作り直す
+    if (r === 'done' && state.shareSize === 'fit' && result.blob.size > SHARE_LIMIT && lastBitrate > MIN_BITRATE) {
+      const next = Math.max(MIN_BITRATE, Math.floor(lastBitrate * ((SHARE_LIMIT * 0.9) / result.blob.size)));
+      showToast(`50MBを少し超えた（${(result.blob.size / 1024 / 1024).toFixed(0)}MB）ので、もう少し小さくして作り直します。`, 5000);
+      r = await buildFast(next);
+    }
     if (r === 'done' || r === 'cancelled') return;
     showToast(`速い書き出しがうまくいかなかったので、いつもの方法で書き出します（少し時間がかかります）。<br><small style="color:#aaa">理由：${escapeHtml(lastFastError)}</small>`, 8000);
   }
@@ -2422,7 +2463,10 @@ async function build(preview = false) {
   const mime = pickMime();
   const rec = preview
     ? null
-    : new MediaRecorder(stream, { ...(mime && { mimeType: mime }), videoBitsPerSecond: BITRATE[state.quality] });
+    : new MediaRecorder(stream, {
+      ...(mime && { mimeType: mime }),
+      videoBitsPerSecond: targetBitrate(makeSegments(clips).reduce((s, sg) => s + sg.len, 0)),
+    });
   const chunks = [];
   let stopped = Promise.resolve();
   if (rec) {
@@ -2965,10 +3009,13 @@ async function pickVideoEncoderConfig(W, H, bitrate) {
   const codecs = ['avc1.640028', 'avc1.4d0028', 'avc1.42e028', 'avc1.640032', 'avc1.42001f'];
   for (const hw of ['prefer-hardware', 'no-preference']) {
     for (const codec of codecs) {
-      const cfg = { codec, width: W, height: H, bitrate, framerate: FAST_FPS, hardwareAcceleration: hw, avc: { format: 'avc' } };
-      try {
-        if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg;
-      } catch (_) {}
+      // 大きさを見込みどおりにするため、できれば一定の細かさ（constant）で圧縮する
+      for (const bitrateMode of ['constant', 'variable']) {
+        const cfg = { codec, width: W, height: H, bitrate, bitrateMode, framerate: FAST_FPS, hardwareAcceleration: hw, avc: { format: 'avc' } };
+        try {
+          if ((await VideoEncoder.isConfigSupported(cfg)).supported) return cfg;
+        } catch (_) {}
+      }
     }
   }
   return null;
@@ -3087,7 +3134,9 @@ async function encodeAudioMix({ clipAudio, total, videoVol, acfg, muxer }) {
 }
 
 // 戻り値：'done'（完成）／'cancelled'（キャンセル）／'failed'（この方法では書き出せなかった）
-async function buildFast() {
+// bitrateOverride：50MBを超えたときの作り直しで、細かさを指定する
+let lastBitrate = 0;
+async function buildFast(bitrateOverride) {
   const clips = buildClips();
   const t0 = performance.now();
   cancelled = false;
@@ -3115,7 +3164,9 @@ async function buildFast() {
     g.fillStyle = '#000';
     g.fillRect(0, 0, W, H);
 
-    const vcfg = await pickVideoEncoderConfig(W, H, BITRATE[state.quality]);
+    const plannedSec = makeSegments(clips).reduce((s, sg) => s + sg.len, 0);
+    lastBitrate = bitrateOverride || targetBitrate(plannedSec);
+    const vcfg = await pickVideoEncoderConfig(W, H, lastBitrate);
     if (!vcfg) throw new Error('no video encoder');
     const videoVol = state.videoVol / 100;
     const withAudio = videoVol > 0 || !!state.bgm;
