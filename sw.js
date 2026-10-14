@@ -1,9 +1,12 @@
 // オフラインでも開けるようにするための Service Worker
 // アプリを更新したら VERSION を上げる
-const VERSION = 'v8';
+const VERSION = 'v9';
 const CACHE = `clip-diary-${VERSION}`;
 const FONT_CACHE = 'clip-diary-fonts';
-const SHELL = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
+const SHELL = [
+  './', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png',
+  './vendor/mp4box.all.min.js', './vendor/mp4-muxer.min.js',
+];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

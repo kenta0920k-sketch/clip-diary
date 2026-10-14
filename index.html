@@ -391,6 +391,9 @@
 <video id="editVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
 <video id="renderVideo" class="hiddenvideo" playsinline webkit-playsinline preload="auto"></video>
 
+<!-- MP4を組み直すための部品（mp4box.js: BSD-3-Clause / mp4-muxer: MIT。vendor/ に同梱） -->
+<script src="vendor/mp4box.all.min.js"></script>
+<script src="vendor/mp4-muxer.min.js"></script>
 <script>
 const $ = (s) => document.querySelector(s);
 
@@ -1909,9 +1912,21 @@ async function build() {
     return;
   }
 
-  const type = rec.mimeType || mime || 'video/webm';
+  let type = rec.mimeType || mime || 'video/webm';
   const ext = type.includes('mp4') ? 'mp4' : 'webm';
-  const blob = new Blob(chunks, { type });
+  let blob = new Blob(chunks, { type });
+  if (ext === 'mp4') {
+    // 録画したままのファイルは「動画の長さ」の情報が正しくなく、ギャラリーで 0:03 などと表示されるので、
+    // 普通のMP4に組み直して正しい長さを書き込む
+    $('#renderText').textContent = '仕上げ中…';
+    $('#renderPct').textContent = '';
+    try {
+      blob = await fixMp4(blob);
+      type = 'video/mp4';
+    } catch (e) {
+      console.warn('fixMp4', e);
+    }
+  }
   const name = `3sec-diary_${fmtDate(new Date()).replaceAll('-', '')}.${ext}`;
   result = { blob, name, type, url: URL.createObjectURL(blob) };
 
@@ -1935,6 +1950,86 @@ async function build() {
     ? `動画が大きい（${(blob.size / 1024 / 1024).toFixed(0)}MB）ため、スマホの共有画面には渡せません（上限50MB）。ダウンロードしてから、ギャラリーやSNSのアプリで共有してください。`
     : '';
   out.play().catch(() => {});
+}
+
+// ---------- MP4の組み直し ----------
+// Chrome の録画（MediaRecorder）が作る MP4 は細切れ形式で、全体の長さが 0 などになっている。
+// mp4box.js で中身（映像・音声のコマ）を取り出し、mp4-muxer で長さの入った普通の MP4 に書き直す。
+const MUX_CODEC = { avc1: 'avc', avc3: 'avc', hvc1: 'hevc', hev1: 'hevc', vp09: 'vp9', av01: 'av1', mp4a: 'aac', Opus: 'opus' };
+
+function boxPayload(box) {
+  const DS = MP4Box.DataStream || window.DataStream;
+  const ds = new DS(undefined, 0, DS.BIG_ENDIAN);
+  box.write(ds);
+  return new Uint8Array(ds.buffer, 8); // 箱の頭（大きさと名前の8バイト）を除いた中身
+}
+
+async function fixMp4(src) {
+  if (!window.MP4Box || !window.Mp4Muxer) throw new Error('mp4 libraries not loaded');
+  const buf = await src.arrayBuffer();
+  buf.fileStart = 0;
+  const file = MP4Box.createFile();
+  let info = null, parseError = null;
+  file.onReady = (i) => { info = i; };
+  file.onError = (e) => { parseError = e; };
+  file.appendBuffer(buf);
+  file.flush();
+  if (!info || parseError) throw new Error(`parse failed: ${parseError || 'no moov'}`);
+
+  const vt = info.videoTracks[0];
+  const at = info.audioTracks[0];
+  if (!vt) throw new Error('no video track');
+  const samples = {};
+  for (const t of [vt, at].filter(Boolean)) {
+    samples[t.id] = [];
+    file.setExtractionOptions(t.id, null, { nbSamples: 1e9 });
+  }
+  file.onSamples = (id, _user, list) => { samples[id].push(...list); };
+  file.start();
+  if (!samples[vt.id].length) throw new Error('no video samples');
+
+  const vEntry = file.getTrackById(vt.id).mdia.minf.stbl.stsd.entries[0];
+  const vCodec = MUX_CODEC[vEntry.type];
+  if (!vCodec) throw new Error(`unsupported video ${vEntry.type}`);
+  const vDesc = vEntry.avcC || vEntry.hvcC ? boxPayload(vEntry.avcC || vEntry.hvcC) : undefined;
+
+  let aCodec = null, aDesc;
+  if (at && samples[at.id].length) {
+    const aEntry = file.getTrackById(at.id).mdia.minf.stbl.stsd.entries[0];
+    aCodec = MUX_CODEC[aEntry.type] || null;
+    if (aCodec === 'aac') aDesc = aEntry.esds?.esd?.descs?.[0]?.descs?.[0]?.data;
+  }
+
+  const target = new Mp4Muxer.ArrayBufferTarget();
+  const muxer = new Mp4Muxer.Muxer({
+    target,
+    fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset',
+    video: { codec: vCodec, width: vt.video.width, height: vt.video.height },
+    audio: aCodec ? { codec: aCodec, sampleRate: at.audio.sample_rate, numberOfChannels: at.audio.channel_count } : undefined,
+  });
+
+  // 映像と音声を、時間の順に交互に書き込む
+  const us = (v, s) => (v * 1e6) / s.timescale;
+  const queue = [
+    ...samples[vt.id].map((s) => ({ s, kind: 'v', t: us(s.dts, s) })),
+    ...(aCodec ? samples[at.id].map((s) => ({ s, kind: 'a', t: us(s.dts, s) })) : []),
+  ].sort((x, y) => x.t - y.t);
+
+  let vFirst = true, aFirst = true;
+  for (const { s, kind } of queue) {
+    if (kind === 'v') {
+      const meta = vFirst ? { decoderConfig: { codec: vt.codec, codedWidth: vt.video.width, codedHeight: vt.video.height, description: vDesc } } : undefined;
+      muxer.addVideoChunkRaw(s.data, s.is_sync ? 'key' : 'delta', us(s.cts, s), us(s.duration, s), meta, us(s.cts - s.dts, s));
+      vFirst = false;
+    } else {
+      const meta = aFirst ? { decoderConfig: { codec: at.codec, sampleRate: at.audio.sample_rate, numberOfChannels: at.audio.channel_count, description: aDesc } } : undefined;
+      muxer.addAudioChunkRaw(s.data, 'key', us(s.cts, s), us(s.duration, s), meta);
+      aFirst = false;
+    }
+  }
+  muxer.finalize();
+  return new Blob([target.buffer], { type: 'video/mp4' });
 }
 
 $('#cancelBtn').addEventListener('click', () => { cancelled = true; });
