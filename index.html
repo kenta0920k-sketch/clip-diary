@@ -267,7 +267,13 @@
       </div>
       <div class="textrow">
         <span>タイトル</span>
-        <input type="text" id="openingTitle" class="titleinput" maxlength="30" placeholder="例：夏の京都（空なら日付だけ）">
+        <input type="text" id="openingTitle" class="titleinput" maxlength="30" placeholder="例：夏の京都">
+      </div>
+      <div class="row">
+        <label>日付</label>
+        <div class="seg" data-key="openingDate">
+          <button data-val="on">あり</button><button data-val="off">なし</button>
+        </div>
       </div>
       <p class="note" id="openingLen" style="text-align:left"></p>
     </div>
@@ -477,7 +483,7 @@ const $ = (s) => document.querySelector(s);
 const DEFAULTS = {
   seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std',
   videoVol: 100, bgmVol: 80, bgmStart: 0, bgmFade: 'on',
-  opening: 'on', openingCount: '6', openingTempo: 'normal', openingTitle: '',
+  opening: 'on', openingCount: '6', openingTempo: 'normal', openingTitle: '', openingDate: 'on',
   look: 'none', grain: 'off', vignette: 'off', stamp: 'on', transition: 'cut',
   textStyle: { font: 'maru', color: '#ffffff', size: 0.07, style: 'shadow', x: 0.5, y: 0.78 },
   adjust: { bright: 0, contrast: 0, sat: 0, temp: 0, fade: 0 },
@@ -559,10 +565,61 @@ function dateLabel(iso) {
 }
 
 // ファイル名に日付があればそれを（Galaxy: 20261013_153012.mp4）、なければ更新日時を使う
-function guessDate(file) {
-  const m = file.name.match(/(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})/);
+function dateFromName(name) {
+  const m = name.match(/(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})/);
   if (m && +m[2] >= 1 && +m[2] <= 12 && +m[3] >= 1 && +m[3] <= 31) return `${m[1]}-${m[2]}-${m[3]}`;
-  return fmtDate(new Date(file.lastModified || Date.now()));
+  return null;
+}
+
+function guessDate(file) {
+  return dateFromName(file.name) || fmtDate(new Date(file.lastModified || Date.now()));
+}
+
+// 動画ファイルの中に記録された撮影日時（目次 moov の中の mvhd の作成日時）を読む。
+// ギャラリーから選ぶとファイルの更新日時が「選んだ日」になることがあるので、こちらのほうが確か
+async function readCreationDate(blob) {
+  try {
+    const boxes = await topBoxes(blob);
+    const moov = boxes.find((b) => b.type === 'moov');
+    if (!moov) return null;
+    const buf = new Uint8Array(await blob.slice(moov.start, moov.start + Math.min(moov.size, 1 << 20)).arrayBuffer());
+    const dv = new DataView(buf.buffer);
+    for (let i = 8; i + 20 < buf.length; i++) {
+      // 'mvhd'
+      if (buf[i] === 0x6d && buf[i + 1] === 0x76 && buf[i + 2] === 0x68 && buf[i + 3] === 0x64) {
+        const secs = buf[i + 4] === 1 ? Number(dv.getBigUint64(i + 8)) : dv.getUint32(i + 8);
+        const ms = (secs - 2082844800) * 1000; // 1904年1月1日からの秒数 → 1970年からのミリ秒
+        const d = new Date(ms);
+        if (!secs || d.getFullYear() < 2005 || ms > Date.now() + 86400000) return null; // 記録されていない・おかしい値
+        return fmtDate(d);
+      }
+    }
+  } catch (e) {
+    console.warn('creation date', e);
+  }
+  return null;
+}
+
+// 撮影日を決める：①ファイル名の日付 → ②動画の中の撮影日時 → ③ファイルの更新日時
+async function detectDate(blob, name, lastModified) {
+  const byName = dateFromName(name);
+  if (byName) return { date: byName, source: 'name' };
+  const byMeta = await readCreationDate(blob);
+  if (byMeta) return { date: byMeta, source: 'meta' };
+  return { date: fmtDate(new Date(lastModified || Date.now())), source: 'modified' };
+}
+
+// 前に読み込んだ動画の日付も、動画の中の撮影日時で直す（自分で直した日付はそのまま）
+async function refreshDates() {
+  let changed = false;
+  for (const c of [...state.clips, ...state.hidden]) {
+    if (c.dateEdited || c.dateSource || !c.file || c.missing) continue;
+    const r = await detectDate(c.file, c.name, c.lastModified);
+    c.dateSource = r.source;
+    if (r.date !== c.date) { c.date = r.date; changed = true; }
+  }
+  if (changed) renderList();
+  scheduleSave();
 }
 
 const segLen = (c) => Math.min(state.seconds, c.duration || state.seconds);
@@ -985,7 +1042,7 @@ async function idb(store, mode, fn) {
 }
 
 const SAVE_KEYS = ['id', 'name', 'size', 'type', 'lastModified', 'duration', 'start', 'date', 'thumb', 'thumbStart',
-  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored'];
+  'strip', 'confirmed', 'text', 'orient', 'keep', 'stored', 'dateSource', 'dateEdited'];
 let restored = false;
 let saveTimer = 0;
 let persistAsked = false;
@@ -1130,6 +1187,9 @@ function addFiles(files) {
         duration: 0, start: 0, date: guessDate(file), thumb: '', strip: null, confirmed: false, error: '', text: null,
         orient: null, keep: false, stored: false, missing: false,
       };
+      const d = await detectDate(file, file.name, file.lastModified);
+      c.date = d.date;
+      c.dateSource = d.source;
       storeVideo(c);
       try {
         await loadSrc(probeVideo, c.url);
@@ -1570,7 +1630,11 @@ document.querySelectorAll('[data-nudge]').forEach((b) => b.addEventListener('cli
   ev.play().catch(() => {});
 }));
 
-$('#editDate').addEventListener('change', (e) => { if (e.target.value) editing.date = e.target.value; });
+$('#editDate').addEventListener('change', (e) => {
+  if (!e.target.value) return;
+  editing.date = e.target.value;
+  editing.dateEdited = true; // 自分で直した日付は、自動で書き換えない
+});
 
 // プレビュー画面：文字タブでは文字をドラッグ、それ以外はタップで再生/一時停止
 function canvasPoint(e) {
@@ -2186,7 +2250,7 @@ function openingRange(clips) {
 let openingOv = null;
 function openingOverlay(W, H, clips) {
   const title = (state.openingTitle || '').trim();
-  const range = openingRange(clips);
+  const range = state.openingDate === 'off' ? '' : openingRange(clips);
   const font = fontOf(state.textStyle.font);
   const key = JSON.stringify([W, H, title, range, font.id, fontsVersion]);
   if (openingOv?.key === key) return openingOv.canvas;
@@ -2939,7 +3003,7 @@ renderNotice();
 renderList();
 renderBgm();
 renderOpening();
-restoreProject();
+restoreProject().then(refreshDates);
 restoreBgm();
 </script>
 </body>
