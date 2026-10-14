@@ -128,6 +128,16 @@
   .pane { display: none; gap: 10px; grid-template-columns: minmax(0, 1fr); }
   .pane.on { display: grid; }
   .pane .row { flex-wrap: wrap; row-gap: 8px; }
+  [hidden] { display: none !important; }
+  .lookmode { justify-content: stretch; }
+  .lookmode button { flex: 1; }
+  .lookpart { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+  .adjusts { display: grid; gap: 6px; }
+  .adj { display: grid; grid-template-columns: 6.2em minmax(0, 1fr) 2.8em; align-items: center; gap: 8px; font-size: 13px; color: #ddd; }
+  .adj output { text-align: right; font-variant-numeric: tabular-nums; color: var(--sub); font-size: 12px; }
+  .adj output.changed { color: var(--accent); font-weight: 700; }
+  .adj input { height: 26px; }
+  #adjustReset { justify-self: end; }
   .pane .seg { flex-wrap: nowrap; }
 
   .strip { position: relative; height: 54px; border-radius: 10px; overflow: hidden; background: #222; touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -283,6 +293,14 @@
     </div>
 
     <div class="pane" data-pane="look">
+      <div class="seg lookmode" id="lookMode">
+        <button data-val="pick" class="on">色味を選ぶ</button><button data-val="adjust">細かく調整</button>
+      </div>
+      <div class="lookpart" data-part="adjust" hidden>
+        <div class="adjusts" id="adjusts"></div>
+        <button class="smallbtn" id="adjustReset">調整をリセット</button>
+      </div>
+      <div class="lookpart" data-part="pick">
       <div class="hscroll looks" id="looks"></div>
       <div class="row">
         <label>フィルムの粒子</label>
@@ -302,7 +320,8 @@
           <button data-val="on">あり</button><button data-val="off">なし</button>
         </div>
       </div>
-      <p class="note">色味・粒子・日付スタンプは全部の動画に共通です。</p>
+      </div>
+      <p class="note">色味・調整・粒子・日付スタンプは全部の動画に共通です。</p>
     </div>
 
     <div class="pane" data-pane="text">
@@ -358,6 +377,7 @@ const DEFAULTS = {
   seconds: 3, aspect: '9:16', fit: 'cover', quality: 'std', audio: 'on',
   look: 'none', grain: 'off', vignette: 'off', stamp: 'on', transition: 'cut',
   textStyle: { font: 'maru', color: '#ffffff', size: 0.07, style: 'shadow', x: 0.5, y: 0.78 },
+  adjust: { bright: 0, contrast: 0, sat: 0, temp: 0, fade: 0 },
 };
 const state = { clips: [], ...structuredClone(DEFAULTS) };
 try { Object.assign(state, JSON.parse(localStorage.getItem('settings') || '{}')); } catch (_) {}
@@ -521,8 +541,36 @@ function vignetteFor(W, H) {
   return vignetteCache.get(key);
 }
 
+// 細かい調整（-100〜100、色あせは0〜100）を、選んだ色味の上に重ねる
+const ADJUSTS = [
+  { key: 'bright', name: '明るさ', min: -100, max: 100 },
+  { key: 'contrast', name: 'コントラスト', min: -100, max: 100 },
+  { key: 'sat', name: '彩度', min: -100, max: 100 },
+  { key: 'temp', name: '色温度', min: -100, max: 100 },
+  { key: 'fade', name: '色あせ', min: 0, max: 100 },
+];
+const ADJUST_ZERO = { bright: 0, contrast: 0, sat: 0, temp: 0, fade: 0 };
+
+function withAdjust(look, a) {
+  if (!a) return look;
+  const css = [
+    look.css === 'none' ? '' : look.css,
+    a.bright ? `brightness(${(1 + a.bright * 0.004).toFixed(3)})` : '',
+    a.contrast ? `contrast(${(1 + a.contrast * 0.005).toFixed(3)})` : '',
+    a.sat ? `saturate(${(1 + a.sat / 100).toFixed(3)})` : '',
+  ].filter(Boolean).join(' ') || 'none';
+  const t = Math.abs(a.temp) / 100;
+  const tint2 = a.temp > 0 ? `rgba(255,140,40,${(t * 0.4).toFixed(3)})` : a.temp < 0 ? `rgba(50,120,255,${(t * 0.4).toFixed(3)})` : null;
+  const v = Math.round((a.fade / 100) * 75);
+  const lift2 = a.fade ? `rgb(${v},${v},${v})` : null;
+  return { ...look, css, tint2, lift2 };
+}
+
 function currentLook() {
-  return { fit: state.fit, look: lookOf(state.look), grain: GRAIN[state.grain] || 0, vignette: state.vignette === 'on' };
+  return {
+    fit: state.fit, look: withAdjust(lookOf(state.look), state.adjust),
+    grain: GRAIN[state.grain] || 0, vignette: state.vignette === 'on',
+  };
 }
 
 // src（video / img / canvas）を W×H に描き、色味・ふち・粒子をかける
@@ -542,9 +590,15 @@ function renderFrame(g, src, sw, sh, W, H, opt) {
     g.fillStyle = opt.look.lift;
     g.fillRect(0, 0, W, H);
   }
-  if (opt.look.tint) {
+  if (opt.look.lift2) {
+    g.globalCompositeOperation = 'lighten';
+    g.fillStyle = opt.look.lift2;
+    g.fillRect(0, 0, W, H);
+  }
+  for (const tint of [opt.look.tint, opt.look.tint2]) {
+    if (!tint) continue;
     g.globalCompositeOperation = 'soft-light';
-    g.fillStyle = opt.look.tint;
+    g.fillStyle = tint;
     g.fillRect(0, 0, W, H);
   }
   g.globalCompositeOperation = 'source-over';
@@ -1007,6 +1061,7 @@ let stripToken = 0;
 const STRIP_N = 10;
 
 function openEditor(c) {
+  if (!c) return;
   editorOpen = true;
   $('#editor').classList.add('show');
   const [W, H] = SIZES.std[state.aspect];
@@ -1286,7 +1341,7 @@ function renderLooks() {
   const paint = () => {
     box.querySelectorAll('button').forEach((b) => {
       const cv = b.querySelector('canvas');
-      const opt = { fit: 'cover', look: lookOf(b.dataset.look), grain: 0, vignette: state.vignette === 'on' };
+      const opt = { fit: 'cover', look: withAdjust(lookOf(b.dataset.look), state.adjust), grain: 0, vignette: state.vignette === 'on' };
       if (src && looksImg.complete && looksImg.naturalWidth) {
         renderFrame(cv.getContext('2d'), looksImg, looksImg.naturalWidth, looksImg.naturalHeight, cv.width, cv.height, opt);
       }
@@ -1301,6 +1356,54 @@ function renderLooks() {
     paint();
   }
 }
+
+// 色味タブ：「色味を選ぶ」と「細かく調整」の切り替え
+state.adjust = { ...ADJUST_ZERO, ...state.adjust };
+$('#lookMode').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-val]');
+  if (!b) return;
+  document.querySelectorAll('#lookMode button').forEach((x) => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.lookpart').forEach((p) => { p.hidden = p.dataset.part !== b.dataset.val; });
+});
+
+$('#adjusts').innerHTML = ADJUSTS.map((a) => `<label class="adj">
+  <span>${a.name}</span>
+  <input type="range" id="adj-${a.key}" data-adj="${a.key}" min="${a.min}" max="${a.max}" step="1">
+  <output id="adjv-${a.key}"></output>
+</label>`).join('');
+
+function syncAdjustUI() {
+  ADJUSTS.forEach((a) => {
+    const v = state.adjust[a.key];
+    $(`#adj-${a.key}`).value = v;
+    const out = $(`#adjv-${a.key}`);
+    out.textContent = v > 0 && a.min < 0 ? `+${v}` : `${v}`;
+    out.classList.toggle('changed', v !== 0);
+  });
+}
+$('#adjusts').addEventListener('input', (e) => {
+  const key = e.target.dataset.adj;
+  if (!key) return;
+  state.adjust = { ...state.adjust, [key]: +e.target.value };
+  syncAdjustUI();
+});
+$('#adjusts').addEventListener('change', () => { saveSettings(); renderLooks(); });
+// スライダーのつまみをダブルタップすると、その項目だけ0に戻す
+$('#adjusts').addEventListener('dblclick', (e) => {
+  const key = e.target.dataset?.adj;
+  if (!key) return;
+  state.adjust = { ...state.adjust, [key]: 0 };
+  syncAdjustUI();
+  saveSettings();
+  renderLooks();
+});
+$('#adjustReset').addEventListener('click', () => {
+  state.adjust = { ...ADJUST_ZERO };
+  syncAdjustUI();
+  saveSettings();
+  renderLooks();
+});
+syncAdjustUI();
 
 // 文字タブ
 $('#fonts').innerHTML = FONTS.map((f) => `<button data-font="${f.id}">
@@ -1360,6 +1463,7 @@ $('#textApplyAll').addEventListener('click', () => {
 
 function leaveClip() {
   const c = editing;
+  if (!c) return;
   c.confirmed = true;
   // 使う部分が変わったときだけサムネイルを作り直す（編集画面を閉じてから）
   if (c.thumbStart !== c.start) enqueueThumb(c);
