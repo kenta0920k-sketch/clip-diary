@@ -269,6 +269,7 @@
 
   <h2>音</h2>
   <section class="settings">
+    <p class="note" style="text-align:left">音量のバーを動かすと、その大きさで実際に音が鳴ります（動画の音とBGMをいっしょに鳴らします）。</p>
     <label class="adj">
       <span>動画の音量</span>
       <input type="range" id="videoVol" min="0" max="100" step="1">
@@ -1840,7 +1841,7 @@ async function build(preview = false) {
   if (!preview && canFastExport()) {
     const r = await buildFast();
     if (r === 'done' || r === 'cancelled') return;
-    showToast('速い書き出しがうまくいかなかったので、いつもの方法で書き出します（少し時間がかかります）。', 6000);
+    showToast(`速い書き出しがうまくいかなかったので、いつもの方法で書き出します（少し時間がかかります）。<br><small style="color:#aaa">理由：${escapeHtml(lastFastError)}</small>`, 8000);
   }
   if (!preview && (!window.MediaRecorder || !HTMLCanvasElement.prototype.captureStream)) {
     alert('このブラウザは動画の書き出しに対応していません。最新のChromeかSafariでお試しください。');
@@ -2147,6 +2148,7 @@ async function getBgmBuffer() {
 }
 
 function stopBgmTry() {
+  stopVolumeSample();
   bgmAudio.pause();
   clearTimeout(bgmTryTimer);
   $('#bgmTry').textContent = '▶ ここから試聴';
@@ -2180,6 +2182,7 @@ $('#bgmRemove').addEventListener('click', () => {
 
 $('#bgmTry').addEventListener('click', () => {
   if (!bgmAudio.paused) { stopBgmTry(); return; }
+  stopVolumeSample();
   if (bgmAudio.dataset.src !== state.bgm.url) {
     bgmAudio.src = state.bgm.url;
     bgmAudio.dataset.src = state.bgm.url;
@@ -2196,15 +2199,56 @@ $('#bgmStart').addEventListener('input', (e) => {
   $('#bgmStartV').textContent = fmtMS(state.bgmStart);
   if (!bgmAudio.paused) bgmAudio.currentTime = state.bgmStart;
 });
+
+// 音量のスライダーを動かしている間は、実際の音を鳴らして大きさを確かめられるようにする。
+// 動画の音（1本目の使う部分）とBGMを、それぞれの音量で同時に鳴らすので、バランスも分かる
+const volVideo = new Audio(); // <audio> に動画ファイルを渡すと、映像は読まずに音だけ再生できる
+const volBgm = new Audio();
+let volTimer = 0;
+function playVolumeSample() {
+  if (!bgmAudio.paused) stopBgmTry();
+  const clip = readyClips()[0];
+  const pairs = [
+    [volVideo, clip?.url, clip?.start || 0, state.videoVol / 100],
+    [volBgm, state.bgm?.url, state.bgmStart, state.bgmVol / 100],
+  ];
+  if (!clip && !state.bgm) {
+    showToast('動画かBGMを選ぶと、ここで音の大きさを試せます。', 3000);
+    return;
+  }
+  for (const [el, src, start, vol] of pairs) {
+    if (!src) { el.pause(); continue; }
+    el.volume = vol;
+    if (el.dataset.src !== src) {
+      el.dataset.src = src;
+      el.src = src;
+    }
+    if (el.paused) {
+      el.currentTime = start;
+      el.play().catch(() => {});
+    }
+  }
+  // 指を離して2.5秒たったら止める
+  clearTimeout(volTimer);
+  volTimer = setTimeout(stopVolumeSample, 2500);
+}
+function stopVolumeSample() {
+  clearTimeout(volTimer);
+  volVideo.pause();
+  volBgm.pause();
+}
+
 $('#bgmVol').addEventListener('input', (e) => {
   state.bgmVol = +e.target.value;
   $('#bgmVolV').textContent = state.bgmVol;
-  bgmAudio.volume = state.bgmVol / 100;
+  playVolumeSample();
 });
 $('#videoVol').addEventListener('input', (e) => {
   state.videoVol = +e.target.value;
   $('#videoVolV').textContent = state.videoVol;
+  playVolumeSample();
 });
+['videoVol', 'bgmVol'].forEach((id) => $(`#${id}`).addEventListener('pointerdown', playVolumeSample));
 ['bgmStart', 'bgmVol', 'videoVol'].forEach((id) => $(`#${id}`).addEventListener('change', saveSettings));
 
 async function restoreBgm() {
@@ -2223,6 +2267,7 @@ $('#previewBtn').addEventListener('click', () => build(true));
 // 動画を「再生」せずに、1コマずつ取り出し（VideoDecoder）→ 色味・文字をのせ → 圧縮（VideoEncoder）して MP4 にする。
 // 再生を待たないので、スマホの処理速度しだいで、完成動画の長さよりずっと短い時間で書き出せる。
 const FAST_FPS = 30;
+let lastFastError = '';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function canFastExport() {
@@ -2251,16 +2296,26 @@ async function topBoxes(blob) {
 async function openMp4(blob) {
   const boxes = await topBoxes(blob);
   const fragmented = boxes.some((b) => b.type === 'moof');
-  const parts = fragmented ? [{ start: 0, size: blob.size }] : boxes.filter((b) => b.type !== 'mdat');
   const file = MP4Box.createFile();
   let info = null, err = null;
   file.onReady = (i) => { info = i; };
   file.onError = (e) => { err = e; };
-  for (const b of parts) {
-    const buf = await blob.slice(b.start, b.start + b.size).arrayBuffer();
-    buf.fileStart = b.start;
-    file.appendBuffer(buf);
+  let buf;
+  if (fragmented) {
+    buf = await blob.arrayBuffer();
+  } else {
+    // 映像データ本体（mdat）以外の箱だけをつなげて渡す。
+    // スマホのカメラの動画は目次（moov）がファイルの後ろにあるので、間を飛ばして読む。
+    // コマの位置は目次に「ファイルの先頭から何バイト目か」で書かれているので、つなげても位置はずれない
+    const parts = await Promise.all(boxes.filter((b) => b.type !== 'mdat').map((b) => blob.slice(b.start, b.start + b.size).arrayBuffer()));
+    const total = parts.reduce((s, p) => s + p.byteLength, 0);
+    const u8 = new Uint8Array(total);
+    let o = 0;
+    for (const p of parts) { u8.set(new Uint8Array(p), o); o += p.byteLength; }
+    buf = u8.buffer;
   }
+  buf.fileStart = 0;
+  file.appendBuffer(buf);
   file.flush();
   if (!info || err) throw new Error(`mp4 parse: ${err || 'no moov'}`);
   return { file, info };
@@ -2603,6 +2658,7 @@ async function buildFast() {
     return 'done';
   } catch (e) {
     console.warn('fast export failed', e);
+    lastFastError = String(e?.message || e).slice(0, 80);
     if (venc && venc.state !== 'closed') venc.close();
     return 'failed';
   } finally {
