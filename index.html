@@ -3166,7 +3166,17 @@ async function buildFast(bitrateOverride) {
 
     const plannedSec = makeSegments(clips).reduce((s, sg) => s + sg.len, 0);
     lastBitrate = bitrateOverride || targetBitrate(plannedSec);
-    const vcfg = await pickVideoEncoderConfig(W, H, lastBitrate);
+    // 縦長の動画は、横長に倒して圧縮し、「90度回して表示」の印を付ける（スマホのカメラと同じやり方）。
+    // スマホの圧縮部品は横長が得意で、縦長のままだと細かさの指定が効かず大きくなることがあるため
+    const portrait = H > W;
+    const encW = portrait ? H : W, encH = portrait ? W : H;
+    let lc = cv, lg = null;
+    if (portrait) {
+      lc = document.createElement('canvas');
+      lc.width = encW; lc.height = encH;
+      lg = lc.getContext('2d');
+    }
+    const vcfg = await pickVideoEncoderConfig(encW, encH, lastBitrate);
     if (!vcfg) throw new Error('no video encoder');
     const videoVol = state.videoVol / 100;
     const withAudio = videoVol > 0 || !!state.bgm;
@@ -3178,7 +3188,7 @@ async function buildFast(bitrateOverride) {
       target,
       fastStart: 'in-memory',
       firstTimestampBehavior: 'offset',
-      video: { codec: 'avc', width: W, height: H, frameRate: FAST_FPS },
+      video: { codec: 'avc', width: encW, height: encH, frameRate: FAST_FPS, rotation: portrait ? 90 : 0 },
       audio: acfg ? { codec: acfg.mux, sampleRate: 48000, numberOfChannels: 2 } : undefined,
     });
     // 「部品の手が空いた・コマができた」の合図を待つ（決まった時間待つより速い）
@@ -3230,7 +3240,13 @@ async function buildFast(bitrateOverride) {
           g.fillStyle = `rgba(${color},${Math.min(1, a)})`;
           g.fillRect(0, 0, W, H);
         }
-        const vf = new VideoFrame(cv, { timestamp: Math.round((outT + rel) * 1e6), duration: Math.round(step * 1e6) });
+        if (portrait) {
+          // 縦の絵を左に90度倒して、横長のキャンバスへ
+          lg.setTransform(0, -1, 1, 0, 0, W);
+          lg.drawImage(cv, 0, 0);
+          lg.setTransform(1, 0, 0, 1, 0, 0);
+        }
+        const vf = new VideoFrame(lc, { timestamp: Math.round((outT + rel) * 1e6), duration: Math.round(step * 1e6) });
         venc.encode(vf, { keyFrame: frameNo % (FAST_FPS * 2) === 0 });
         vf.close();
         frameNo++;
@@ -3317,6 +3333,9 @@ async function buildFast(bitrateOverride) {
     muxer.finalize();
     const blob = new Blob([target.buffer], { type: 'video/mp4' });
     showResult(blob, 'video/mp4', 'mp4', clips.length, (performance.now() - t0) / 1000);
+    // 実際の細かさ（確認用）
+    const realMbps = (blob.size * 8) / Math.max(1, outT) / 1e6;
+    $('#resultInfo').textContent += ` ・ ${realMbps.toFixed(1)}Mbps`;
     return 'done';
   } catch (e) {
     console.warn('fast export failed', e);
